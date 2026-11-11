@@ -243,7 +243,10 @@ pub fn list_books(db: &Db, user_id: &str, q: &ListQuery) -> ApiResult<Value> {
         "JOIN user_books ub ON ub.book_id = b.id LEFT JOIN reading_progress rp ON rp.user_id = ub.user_id AND rp.book_id = b.id"
     };
     let shelf_column = if library {
-        ", ub.hidden AS shelf_hidden"
+        // A missing `user_books` row and `hidden = 1` are both "off the shelf".
+        // Without COALESCE, LEFT JOIN's NULL reads as 0 and an off-shelf book
+        // is reported as `on`, which hides the library page's 加入书架 button.
+        ", COALESCE(ub.hidden, 1) AS shelf_hidden"
     } else {
         ""
     };

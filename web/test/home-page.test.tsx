@@ -32,7 +32,14 @@ function mount(reading: object[] = [book]) {
     root,
   ));
 }
-const settle = () => act(async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
+/** Wait for the async query to paint, not just one tick: under a loaded CI
+ * runner a single 20ms tick can finish before React commits the resolved data. */
+const settle = async (until: () => boolean = () => true, timeout = 2000) => {
+  const start = Date.now();
+  do {
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
+  } while (!until() && Date.now() - start < timeout);
+};
 
 afterEach(() => { act(() => render(null, root)); useAuthStore.setState({ session: null, verifiedUser: null }); });
 
@@ -44,7 +51,7 @@ describe('首页', () => {
   it('resumes the book, then shows the shelf, with no media cards', async () => {
     useAuthStore.setState({ verifiedUser: user as any });
     mount();
-    await settle();
+    await settle(() => !!root.querySelector('a.home-hero'));
     expect(root.querySelector('h1')?.textContent).toContain('林间');
     const hero = root.querySelector<HTMLAnchorElement>('a.home-hero')!;
     expect(hero.getAttribute('href')).toBe('/book/b1');
@@ -58,7 +65,7 @@ describe('首页', () => {
   it('invites the reader to the shelf when nothing is in progress', async () => {
     useAuthStore.setState({ verifiedUser: user as any });
     mount([]);
-    await settle();
+    await settle(() => !!root.querySelector('.home-empty'));
     expect(root.querySelector('a.home-hero')).toBeNull();
     expect(root.querySelector('.home-empty a')?.getAttribute('href')).toBe('/shelf');
   });

@@ -572,8 +572,9 @@ async fn library_facets(State(state): State<AppState>, Auth(user): Auth) -> ApiR
 
 async fn library_browse(State(state): State<AppState>, Auth(user): Auth, Query(query): Query<HashMap<String, String>>) -> ApiResult<Json<Value>> {
     let page = qp_int(&query, "page")?.unwrap_or(1);
-    browse::browse(&state, &qp(&query, "path").unwrap_or_default(), page).map(Json)
-        .map(|mut v| { v["user"] = json!(user.id); v })
+    let page_size = qp_int(&query, "pageSize")?.unwrap_or(browse::BROWSE_PAGE_SIZE);
+    let path = qp(&query, "path").unwrap_or_default();
+    browse::browse(&state, &path, page, page_size, &user.id).map(Json)
 }
 
 async fn library_browse_move(State(state): State<AppState>, Auth(_): Auth, Json(body): Json<Value>) -> ApiResult<Json<Value>> {

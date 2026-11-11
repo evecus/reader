@@ -1,6 +1,7 @@
 //! Library file manager. Every path goes through `resolve_inside`, which
 //! refuses traversal and never follows symlinks (matching lib/paths.ts).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -38,58 +39,192 @@ fn rel_of(books_dir: &Path, abs: &Path) -> String {
     abs.strip_prefix(books_dir).unwrap_or(abs).to_string_lossy().replace('\\', "/")
 }
 
-pub fn browse(state: &AppState, path: &str, page: i64) -> ApiResult<Value> {
-    let dir = resolve_inside(&state.config.books_dir, path)?;
-    if !dir.exists() { return Err(api_err(404, "NOT_FOUND", "directory not found")); }
-    if !dir.is_dir() { return Err(bad_request("not a directory", "NOT_A_DIRECTORY")); }
-    let page_size = 100i64;
-    let mut entries: Vec<(String, bool, u64, i64)> = Vec::new();
+/// Directories the scanner never descends into; `BrowseEntry.hiddenByRule`
+/// reports them so a book that failed to appear on the shelf can be explained.
+const SKIPPED_DIRS: [&str; 6] = [".git", "@eaDir", "#recycle", ".DS_Store", "lost+found", "__MACOSX"];
+/// Never offered for listing: reachable by name, never by discovery.
+const VCS_DIRS: [&str; 3] = [".git", ".svn", ".hg"];
+/// `server/src/services/browse.ts`: BROWSE_PAGE_SIZE / BROWSE_PAGE_SIZE_MAX.
+pub const BROWSE_PAGE_SIZE: i64 = 200;
+const BROWSE_PAGE_SIZE_MAX: i64 = 1000;
+
+fn extension_of(name: &str) -> String {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => name[dot + 1..].to_ascii_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// A *page* inside a book rather than a book: a loose `.jpg` is a book on its
+/// own, but the same extension inside a comic folder is one of its pages.
+fn is_page_extension(ext: &str) -> bool {
+    matches!(ext, "jpg" | "jpeg" | "jpe" | "png" | "gif" | "webp" | "bmp" | "avif" | "tif" | "tiff" | "jxl")
+}
+
+fn is_book_file(name: &str) -> bool {
+    let ext = extension_of(name);
+    !ext.is_empty() && indexer::supported_extension(name) && !is_page_extension(&ext)
+}
+
+fn crumbs_for(rel: &str) -> Vec<Value> {
+    let mut crumbs = vec![json!({ "name": "书库", "path": "" })];
+    if rel.is_empty() { return crumbs; }
+    let mut acc = String::new();
+    for part in rel.split('/') {
+        if acc.is_empty() { acc.push_str(part); } else { acc.push('/'); acc.push_str(part); }
+        crumbs.push(json!({ "name": part, "path": acc }));
+    }
+    crumbs
+}
+
+#[cfg(unix)]
+fn mode_of(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::PermissionsExt;
+    (meta.permissions().mode() & 0o777) as u64
+}
+
+#[cfg(not(unix))]
+fn mode_of(_meta: &std::fs::Metadata) -> u64 { 0 }
+
+/// The library as a *tree*, for the file-manager screen. The response shape is
+/// `BrowseListing` from the Node server — `crumbs` and `entries`, not a flat
+/// `items` array — because the page renders breadcrumbs, per-row scanner flags
+/// and the caller's shelf state from those fields.
+pub fn browse(state: &AppState, path: &str, page: i64, page_size: i64, user_id: &str) -> ApiResult<Value> {
+    let rel = path.trim_end_matches('/');
+    let dir = resolve_inside(&state.config.books_dir, rel)?;
+    let info = std::fs::metadata(&dir)
+        .map_err(|_| api_err(404, "DIR_NOT_FOUND", "no such directory"))?;
+    if !info.is_dir() { return Err(bad_request("not a directory", "NOT_A_DIRECTORY")); }
+
+    let mut rows: Vec<Value> = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
-        let ft = entry.file_type()?;
-        if ft.is_symlink() { continue; }
         let name = entry.file_name().to_string_lossy().into_owned();
+        if VCS_DIRS.contains(&name.as_str()) { continue; }
+        let child_rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        let child_abs = resolve_inside(&state.config.books_dir, &child_rel)?;
+        // symlink_metadata: a link is shown as `other`, never followed. Walking
+        // a link out of the mount would describe a tree the index does not have.
+        let meta = match std::fs::symlink_metadata(&child_abs) { Ok(m) => m, Err(_) => continue };
+        let ft = meta.file_type();
         let is_dir = ft.is_dir();
-        let meta = entry.metadata()?;
-        let size = if is_dir { 0 } else { meta.len() };
-        let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        let is_file = ft.is_file();
+        let kind = if is_dir { "dir" } else if is_file { "file" } else { "other" };
+        let size = if is_dir { 0u64 } else { meta.len() };
+        let mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64).unwrap_or(0);
-        entries.push((name, is_dir, size, mtime));
-    }
-    entries.sort_by(|a, b| {
-        if a.1 != b.1 { return b.1.cmp(&a.1); }
-        indexer::natural_compare(&a.0, &b.0)
-    });
-    let total = entries.len() as i64;
-    let start = ((page.max(1) - 1) * page_size) as usize;
-    let slice = entries.iter().skip(start).take(page_size as usize);
-    let items: Vec<Value> = slice.map(|(name, is_dir, size, mtime)| {
-        let rel = if path.is_empty() { name.clone() } else { format!("{}/{}", path.trim_end_matches('/'), name) };
-        json!({
+        let hidden = name.starts_with('.');
+        let hidden_by_rule = if is_dir {
+            SKIPPED_DIRS.contains(&name.as_str()) || hidden
+        } else {
+            SKIPPED_DIRS.contains(&name.as_str())
+        };
+        let ext = extension_of(&name);
+        let scanned = is_file && is_book_file(&name);
+        let indexed = state.db
+            .one("SELECT 1 FROM book_files WHERE rel_path = ?1", [&child_rel])?
+            .is_some();
+        rows.push(json!({
             "name": name,
-            "path": rel,
-            "isDirectory": is_dir,
+            "path": child_rel,
+            "type": kind,
             "size": size,
             "mtime": mtime,
-        })
-    }).collect();
+            "mode": mode_of(&meta),
+            "hidden": hidden,
+            "hiddenByRule": hidden_by_rule,
+            "scanned": scanned,
+            "ext": ext,
+            "indexed": indexed,
+            "shelfState": Value::Null,
+        }));
+    }
+    rows.sort_by(|a, b| {
+        a.get("name").and_then(Value::as_str).unwrap_or("")
+            .cmp(b.get("name").and_then(Value::as_str).unwrap_or(""))
+    });
+
+    // Resolve shelf state for the whole page in two queries, not one per row.
+    // A missing `user_books` row and `hidden = 1` are both "off the shelf".
+    let indexed_paths: Vec<String> = rows.iter()
+        .filter(|r| r.get("indexed").and_then(Value::as_bool).unwrap_or(false))
+        .filter_map(|r| r.get("path").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut book_by_path: HashMap<String, String> = HashMap::new();
+    if !indexed_paths.is_empty() {
+        let placeholders = (0..indexed_paths.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT rel_path, book_id FROM book_files WHERE rel_path IN ({placeholders})");
+        let params: Vec<Box<dyn rusqlite::ToSql>> = indexed_paths.iter()
+            .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::ToSql>).collect();
+        for r in state.db.query(&sql, rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())))? {
+            book_by_path.insert(db::s(&r, "rel_path"), db::s(&r, "book_id"));
+        }
+    }
+    let book_ids: Vec<String> = book_by_path.values().cloned().collect::<HashSet<_>>().into_iter().collect();
+    let mut on_shelf: HashSet<String> = HashSet::new();
+    if !book_ids.is_empty() {
+        let placeholders = (0..book_ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT book_id FROM user_books WHERE user_id = ? AND hidden = 0 AND book_id IN ({placeholders})"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(user_id.to_string())];
+        params.extend(book_ids.iter().map(|id| Box::new(id.clone()) as Box<dyn rusqlite::ToSql>));
+        for r in state.db.query(&sql, rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())))? {
+            on_shelf.insert(db::s(&r, "book_id"));
+        }
+    }
+    for row in rows.iter_mut() {
+        let is_dir = row.get("type").and_then(Value::as_str) == Some("dir");
+        let shelf = if is_dir { Value::Null } else {
+            match row.get("path").and_then(Value::as_str).and_then(|p| book_by_path.get(p)) {
+                Some(id) => json!(if on_shelf.contains(id) { "on" } else { "off" }),
+                None => Value::Null,
+            }
+        };
+        if let Some(obj) = row.as_object_mut() { obj.insert("shelfState".into(), shelf); }
+    }
+
+    // Counts describe the whole directory; `entries` is one page of it.
+    let total = rows.len();
+    let dirs = rows.iter().filter(|r| r.get("type").and_then(Value::as_str) == Some("dir")).count();
+    let files = rows.iter().filter(|r| r.get("type").and_then(Value::as_str) == Some("file")).count();
+    let total_size: u64 = rows.iter().filter_map(|r| r.get("size").and_then(Value::as_u64)).sum();
+    let per_page = page_size.clamp(1, BROWSE_PAGE_SIZE_MAX) as usize;
+    let offset = (page.max(1) - 1) as usize * per_page;
+    let entries: Vec<Value> = rows.iter().skip(offset).take(per_page).cloned().collect();
+    let parent = if rel.is_empty() { Value::Null } else {
+        match rel.rsplit_once('/') {
+            Some((p, _)) => json!(p),
+            None => json!(""),
+        }
+    };
     Ok(json!({
-        "path": path,
-        "items": items,
+        "path": rel,
+        "crumbs": crumbs_for(rel),
+        "parent": parent,
+        "entries": entries,
         "total": total,
-        "page": page.max(1),
-        "pageSize": page_size,
-        "writable": is_writable(&state.config.books_dir),
+        "dirs": dirs,
+        "files": files,
+        "size": total_size,
+        "writable": writable_at(&dir),
+        "name": if rel.is_empty() { "" } else { rel.rsplit('/').next().unwrap_or("") },
     }))
 }
 
-pub fn is_writable(books_dir: &Path) -> bool {
-    let probe = books_dir.join(".reader-write-probe");
-    match std::fs::write(&probe, b"") {
-        Ok(()) => { let _ = std::fs::remove_file(probe); true }
+/// Probe by actually creating a directory: mode bits lie on a read-only bind
+/// mount, and a cached answer would go stale the moment the mount is remounted.
+fn writable_at(dir: &Path) -> bool {
+    let probe = dir.join(format!(".reader-write-probe-{}", uuid::Uuid::new_v4()));
+    match std::fs::create_dir(&probe) {
+        Ok(()) => { let _ = std::fs::remove_dir(&probe); true }
         Err(_) => false,
     }
 }
+
+pub fn is_writable(books_dir: &Path) -> bool { writable_at(books_dir) }
 
 fn require_writable(state: &AppState) -> ApiResult<()> {
     if !is_writable(&state.config.books_dir) {
