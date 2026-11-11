@@ -1,5 +1,5 @@
 [package]
-name = "reader-rs"
+name = "reader"
 version = "0.1.0"
 edition = "2021"
 description = "reader: self-hosted book library, Rust backend with an embedded web client"
@@ -61,6 +61,8 @@ bytes = "1.12.1"
 chrono = "0.4.45"
 
 [profile.release]
-opt-level = 2
-lto = "thin"
-strip = true
+opt-level = "s"        # 单二进制体积优先
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
