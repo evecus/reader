@@ -25,7 +25,7 @@ export function LoginPage() {
   const [busy, setBusy] = useState(false);
   const probe = useRef<ReturnType<typeof setTimeout> | null>(null);
   const probeGeneration = useRef(0);
-  useEffect(() => { if (session) navigate('/media/video', { replace: true }); }, [session, navigate]);
+  useEffect(() => { if (session) navigate('/shelf', { replace: true }); }, [session, navigate]);
   useEffect(() => {
     const value = serverUrl.trim();
     probeGeneration.current += 1;
@@ -65,7 +65,15 @@ export function LoginPage() {
       await runtime.settings.setServerUrl(url);
       await runtime.authenticated();
     } catch (reason) {
-      setError(reason instanceof ApiError ? (reason.isConnectivity ? '连不上服务端，检查地址和网络' : reason.code === 'REGISTRATION_DISABLED' ? '此实例已关闭公开注册，请让管理员创建账号' : reason.code === 'INVITE_REQUIRED' || reason.code === 'INVALID_INVITE' ? '请输入有效的邀请码' : reason.code === 'PASSWORD_TOO_SHORT' ? '密码至少 8 位' : reason.isAuthFailure ? '用户名或密码错误' : reason.message) : reason instanceof Error ? reason.message : '登录失败');
+      const code = reason instanceof ApiError ? reason.code : '';
+      setError(reason instanceof ApiError ? (reason.isConnectivity ? '连不上服务端，检查地址和网络' : code === 'REGISTRATION_DISABLED' ? '此实例已关闭公开注册，请让管理员创建账号' : code === 'INVITE_REQUIRED' || code === 'INVALID_INVITE' ? '请输入有效的邀请码' : code === 'USERNAME_TAKEN' ? '该用户名已被注册，请直接登录' : code === 'USERNAME_TOO_SHORT' ? '用户名至少 3 个字符' : code === 'PASSWORD_TOO_SHORT' ? '密码至少 8 位' : reason.isAuthFailure ? '用户名或密码错误' : reason.message) : reason instanceof Error ? reason.message : '登录失败');
+      // A failed registration invalidates the "fresh instance" snapshot: the
+      // first attempt may already have created the account. Re-probe so the
+      // notice and the register/login switch agree with the server again.
+      if (registering && code) {
+        if (code === 'USERNAME_TAKEN' || code === 'REGISTRATION_DISABLED') setRegistering(false);
+        void probeServer(url);
+      }
     } finally { setBusy(false); }
   };
   const canRegister = !!instance?.registrationOpen;

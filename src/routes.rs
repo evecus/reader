@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use crate::{
     auth::{self, AuthUser},
     browse, dto,
-    error::{api_err, bad_request, forbidden, not_found, ApiResult},
+    error::{api_err, bad_request, conflict, forbidden, not_found, ApiResult},
     indexer, opds, settings, sources,
     state::{now_ms, ok, AppState, Auth},
     sync, web,
@@ -193,33 +193,66 @@ fn parse_list_query(query: &HashMap<String, String>) -> ApiResult<dto::ListQuery
 async fn auth_register(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResult<Response> {
     let username = require_string(Some(&body), "username")?;
     let password = require_string(Some(&body), "password")?;
-    if username.len() > 64 || !username.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@') {
-        return Err(bad_request("invalid username", "BAD_REQUEST"));
+    let display_name = body.get("displayName").and_then(Value::as_str).unwrap_or("").trim();
+    if username.chars().count() < 3 {
+        return Err(conflict("用户名至少 3 个字符", "USERNAME_TOO_SHORT"));
     }
-    if password.len() < 8 { return Err(bad_request("password must be at least 8 characters", "BAD_REQUEST")); }
-    // Invite code arrives in the body when registration mode is `invite`.
-    let invite = body.get("inviteCode").and_then(Value::as_str);
-    settings::check_registration(&state.db, invite)?;
+    if username.len() > 64 || !username.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@') {
+        return Err(bad_request("用户名包含非法字符或过长", "BAD_REQUEST"));
+    }
+    if display_name.len() > 100 { return Err(bad_request("显示名过长", "BAD_REQUEST")); }
+    if password.len() < 8 { return Err(conflict("密码至少 8 位", "PASSWORD_TOO_SHORT")); }
+
+    let invite_id = settings::check_registration(
+        &state.db,
+        body.get("inviteCode").and_then(Value::as_str),
+    )?;
     let first_user = state.db.count("SELECT COUNT(*) FROM users")? == 0;
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     let hash = auth::hash_password(&password)?;
-    state.db.exec(
-        "INSERT INTO users (id, username, display_name, password_hash, role, disabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)",
-        rusqlite::params![id, username, username, hash, if first_user { "admin" } else { "member" }, now],
-    )?;
-    if let Some(code) = invite.filter(|_| !invite.unwrap_or("").is_empty()) {
-        let code_hash = auth::hash_refresh_token(code);
-        state.db.exec(
-            "UPDATE registration_invites SET used_count = used_count + 1 WHERE code_hash = ?1",
-            [code_hash],
+    let role = if first_user { "admin" } else { "member" };
+    let shown_name = if display_name.is_empty() { username.as_str() } else { display_name };
+
+    // Check-and-insert in one write transaction: SQLite serialises writers, so
+    // no concurrent registration can slip between the two statements. A UNIQUE
+    // violation is a business conflict, never an internal error with a raw
+    // SQLite message leaked to the client.
+    state.db.transaction(|conn| {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE username = ?1 COLLATE NOCASE)",
+            [&username],
+            |r| r.get(0),
         )?;
-    }
-    let role = state.db.one("SELECT role FROM users WHERE id = ?1", [&id])?
-        .map(|r| crate::db::s(&r, "role")).unwrap_or_else(|| "member".into());
-    let user = AuthUser { id, role, ver: 0 };
-    session_response(&state, &user, StatusCode::CREATED)
+        if exists {
+            return Err(conflict("该用户名已被注册，请直接登录", "USERNAME_TAKEN"));
+        }
+        conn.execute(
+            "INSERT INTO users (id, username, display_name, password_hash, role, disabled, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)",
+            rusqlite::params![id, username, shown_name, hash, role, now],
+        ).map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    conflict("该用户名已被注册，请直接登录", "USERNAME_TAKEN"),
+            other => crate::error::AppError::internal(other),
+        })?;
+        if let Some(invite) = &invite_id {
+            conn.execute(
+                "UPDATE registration_invites SET used_count = used_count + 1 WHERE id = ?1",
+                rusqlite::params![invite],
+            )?;
+        }
+        Ok(())
+    })?;
+
+    let user = AuthUser { id, role: role.to_string(), ver: 0 };
+    let session = issue_session(&state, &user)?;
+    let public_user = session.get("user").cloned().unwrap_or_else(|| json!({}));
+    Ok(no_store_response(
+        StatusCode::CREATED,
+        json!({ "user": public_user, "session": session }),
+    ))
 }
 
 async fn auth_login(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResult<Response> {
@@ -247,35 +280,56 @@ fn unauthorized_login() -> crate::error::AppError {
     crate::error::unauthorized("用户名或密码错误", "INVALID_CREDENTIALS")
 }
 
-/// Issues an access token plus a refresh token row; the body shape matches the
-/// Node server exactly (`token`, `expiresAt`, `refreshToken`, `user`).
-fn session_response(state: &AppState, user: &AuthUser, status: StatusCode) -> ApiResult<Response> {
-    let (token, expires_at) = auth::sign_access_token(&state.config, user)?;
+/// Issues an access token plus a refresh token row. The body is the web
+/// client's `Session` shape, byte-for-byte the one the Node server returned:
+/// `user`, `accessToken`, `accessTokenExpiresAt`, `refreshToken`,
+/// `refreshTokenExpiresAt`. Every timestamp is epoch milliseconds.
+fn issue_session(state: &AppState, user: &AuthUser) -> ApiResult<Value> {
+    let (access_token, access_expires_at) = auth::sign_access_token(&state.config, user)?;
     let refresh = auth::new_refresh_token();
     let now = now_ms();
-    let expires = now + state.config.refresh_ttl;
+    // refresh_ttl is seconds; both the DB column and the client use ms.
+    let refresh_expires_at = now + state.config.refresh_ttl * 1000;
     state.db.exec(
         "INSERT INTO refresh_tokens (id, user_id, token_hash, device, created_at, expires_at) VALUES (?1, ?2, ?3, '', ?4, ?5)",
-        rusqlite::params![refresh.id, user.id, refresh.hash, now, expires],
+        rusqlite::params![refresh.id, user.id, refresh.hash, now, refresh_expires_at],
     )?;
-    let row = state.db.one("SELECT username, display_name FROM users WHERE id = ?1", [&user.id])?;
-    let payload = json!({
-        "token": token,
-        "expiresAt": expires_at,
-        "refreshToken": refresh.token,
+    let row = state.db.one(
+        "SELECT username, display_name, created_at FROM users WHERE id = ?1",
+        [&user.id],
+    )?;
+    let username = row.as_ref().map(|r| crate::db::s(r, "username")).unwrap_or_default();
+    let stored_display = row.as_ref().map(|r| crate::db::s(r, "display_name")).unwrap_or_default();
+    let display_name = if stored_display.is_empty() { username.clone() } else { stored_display };
+    let created_at = row.as_ref().map(|r| crate::db::i(r, "created_at")).unwrap_or(0);
+    Ok(json!({
         "user": {
             "id": user.id,
-            "username": row.as_ref().map(|r| crate::db::s(r, "username")).unwrap_or_default(),
-            "displayName": row.as_ref().map(|r| crate::db::s(r, "display_name")).unwrap_or_default(),
+            "username": username,
+            "displayName": display_name,
             "role": user.role,
+            "createdAt": created_at,
         },
-    });
+        "accessToken": access_token,
+        "accessTokenExpiresAt": access_expires_at,
+        "refreshToken": refresh.token,
+        "refreshTokenExpiresAt": refresh_expires_at,
+    }))
+}
+
+/// Auth responses must never be cached: a stale body would hand out an old
+/// token or, for `/api/v1/instance`, an obsolete `userCount`.
+fn no_store_response(status: StatusCode, payload: Value) -> Response {
     let mut response = (status, Json(payload)).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-store"),
     );
-    Ok(response)
+    response
+}
+
+fn session_response(state: &AppState, user: &AuthUser, status: StatusCode) -> ApiResult<Response> {
+    Ok(no_store_response(status, issue_session(state, user)?))
 }
 
 async fn auth_refresh(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResult<Response> {
@@ -289,10 +343,10 @@ async fn auth_refresh(State(state): State<AppState>, Json(body): Json<Value>) ->
     if crate::db::i(&row, "revoked_at").is_positive() || crate::db::i(&row, "expires_at") <= now_ms() {
         return Err(crate::error::unauthorized("refresh token expired", "REFRESH_INVALID"));
     }
-    let user_id = crate::db::s(&row, "id");
+    let presented_token_id = crate::db::s(&row, "id");
     state.db.exec(
         "UPDATE refresh_tokens SET revoked_at = ?1 WHERE id = ?2",
-        rusqlite::params![now_ms(), user_id],
+        rusqlite::params![now_ms(), presented_token_id],
     )?;
     let user_row = state.db.one(
         "SELECT id, role, disabled, auth_version FROM users WHERE id = ?1",
@@ -348,8 +402,8 @@ async fn auth_password(State(state): State<AppState>, Auth(user): Auth, Json(bod
 
 // --------------------------------------------------------- instance / admin
 
-async fn instance(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    settings::instance_info(&state).map(Json)
+async fn instance(State(state): State<AppState>) -> ApiResult<Response> {
+    Ok(no_store_response(StatusCode::OK, settings::instance_info(&state)?))
 }
 
 async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {

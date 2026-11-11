@@ -100,32 +100,35 @@ pub fn disable_invite(db: &Db, id: &str) -> ApiResult<Value> {
     Ok(json!({ "ok": true }))
 }
 
-/// Returns Ok(()) when registration is permitted; enforces invite codes and
-/// the `closed` mode. The first account is always allowed (admin bootstrap).
-pub fn check_registration(db: &Db, invite_code: Option<&str>) -> ApiResult<()> {
+/// Validates that registration is permitted and returns the invite row whose
+/// usage counter must be incremented. The first account is always allowed
+/// (admin bootstrap). The counter is deliberately *not* touched here: the
+/// caller increments it in the same transaction as the INSERT, so a failed
+/// registration cannot burn an invite and a successful one counts exactly once.
+pub fn check_registration(db: &Db, invite_code: Option<&str>) -> ApiResult<Option<String>> {
     let count = db.count("SELECT COUNT(*) FROM users")?;
-    if count == 0 { return Ok(()); }
+    if count == 0 { return Ok(None); }
     let mode = db.one("SELECT mode FROM registration_settings WHERE id = 1", [])?
         .map(|r| db::s(&r, "mode")).unwrap_or_else(|| "open".into());
     match mode.as_str() {
-        "open" => Ok(()),
-        "closed" => Err(forbidden("registration is closed", "REGISTRATION_CLOSED")),
+        "open" => Ok(None),
+        "closed" => Err(forbidden("此实例已关闭公开注册", "REGISTRATION_DISABLED")),
         "invite" => {
-            let code = invite_code.ok_or_else(|| bad_request("invite code is required", "INVITE_REQUIRED"))?;
+            let code = invite_code.filter(|c| !c.is_empty())
+                .ok_or_else(|| bad_request("请输入邀请码", "INVITE_REQUIRED"))?;
             let hash = crate::auth::hash_refresh_token(code);
             let row = db.one(
                 "SELECT id, max_uses, used_count, expires_at, disabled FROM registration_invites WHERE code_hash = ?1",
                 [hash],
-            )?.ok_or_else(|| bad_request("invalid invite code", "INVITE_INVALID"))?;
+            )?.ok_or_else(|| bad_request("邀请码无效", "INVALID_INVITE"))?;
             if db::i(&row, "disabled") != 0 || db::i(&row, "expires_at") < crate::state::now_ms()
                 || db::i(&row, "used_count") >= db::i(&row, "max_uses")
             {
-                return Err(bad_request("invite code is no longer valid", "INVITE_INVALID"));
+                return Err(bad_request("邀请码已失效或用尽", "INVALID_INVITE"));
             }
-            db.exec("UPDATE registration_invites SET used_count = used_count + 1 WHERE id = ?1", [db::s(&row, "id")])?;
-            Ok(())
+            Ok(Some(db::s(&row, "id")))
         }
-        _ => Ok(()),
+        _ => Ok(None),
     }
 }
 
@@ -264,19 +267,35 @@ pub fn admin_create_user(state: &AppState, body: &Value) -> ApiResult<Value> {
     if username.is_empty() || password.len() < 6 {
         return Err(bad_request("username and a password of >= 6 chars are required", "BAD_REQUEST"));
     }
-    if state.db.one("SELECT id FROM users WHERE username = ?1 COLLATE NOCASE", [username])?.is_some() {
-        return Err(conflict("username already taken", "USERNAME_TAKEN"));
+    let display_name = body.get("displayName").and_then(Value::as_str).unwrap_or(username);
+    let role = body.get("role").and_then(Value::as_str).unwrap_or("member");
+    // Without this the CHECK(role IN ...) constraint would surface as a 500
+    // with a raw SQLite message.
+    if !["admin", "member"].contains(&role) {
+        return Err(bad_request("role must be admin or member", "BAD_REQUEST"));
     }
     let id = Uuid::new_v4().to_string();
     let now = crate::state::now_ms();
-    state.db.exec(
-        "INSERT INTO users (id, username, display_name, password_hash, role, disabled, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,0,?6,?6)",
-        rusqlite::params![id, username,
-            body.get("displayName").and_then(Value::as_str).unwrap_or(username),
-            crate::auth::hash_password(password)?,
-            body.get("role").and_then(Value::as_str).unwrap_or("member"), now],
-    )?;
+    let hash = crate::auth::hash_password(password)?;
+    state.db.transaction(|conn| {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE username = ?1 COLLATE NOCASE)",
+            [username],
+            |r| r.get(0),
+        )?;
+        if exists { return Err(conflict("用户名已被占用", "USERNAME_TAKEN")); }
+        conn.execute(
+            "INSERT INTO users (id, username, display_name, password_hash, role, disabled, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,0,?6,?6)",
+            rusqlite::params![id, username, display_name, hash, role, now],
+        ).map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    conflict("用户名已被占用", "USERNAME_TAKEN"),
+            other => crate::error::AppError::internal(other),
+        })?;
+        Ok(())
+    })?;
     Ok(json!({ "user": { "id": id, "username": username } }))
 }
 
@@ -311,10 +330,15 @@ pub fn instance_info(state: &AppState) -> ApiResult<Value> {
     let users = state.db.count("SELECT COUNT(*) FROM users")?;
     let reg = registration(&state.db)?;
     let mode = reg.get("mode").and_then(Value::as_str).unwrap_or("open");
+    // A fresh instance is always open: its first account becomes admin, so the
+    // stored mode must never lock the owner out of claiming it.
+    let effective = if users == 0 { "open" } else { mode };
     Ok(json!({
         "name": "reader",
         "apiVersion": 1,
-        "registrationOpen": mode != "closed",
+        "registrationOpen": effective != "closed",
+        "registrationMode": effective,
+        "invitationRequired": users > 0 && mode == "invite",
         "userCount": users,
     }))
 }

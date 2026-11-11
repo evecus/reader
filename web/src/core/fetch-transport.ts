@@ -24,6 +24,11 @@ export class FetchTransport implements Transport {
         // it chose itself.
         ...(request.body !== undefined ? { body: request.body } : {}),
         ...(request.signal ? { signal: request.signal } : {}),
+        // Instance state decides whether the screen offers registration. A
+        // cached `userCount: 0` would keep showing "全新实例" long after the
+        // account was created, so this request must bypass the HTTP cache even
+        // when an older server forgot to send `Cache-Control: no-store`.
+        ...(request.url.includes('/api/v1/instance') ? { cache: 'no-store' as const } : {}),
         mode: 'cors',
         credentials: 'omit',
       });
