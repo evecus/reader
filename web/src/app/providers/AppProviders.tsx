@@ -1,0 +1,27 @@
+import { useEffect, type ReactNode } from 'react';
+import { QueryClientProvider } from '@tanstack/react-query';
+import type { AppRuntime } from '../runtime.ts';
+import { RuntimeContext } from './runtime-context.tsx';
+
+export function AppProviders({ runtime, children }: { runtime: AppRuntime; children: ReactNode }) {
+  useEffect(() => runtime.connect(), [runtime]);
+  useEffect(() => {
+    const visibility = () => {
+      if (document.visibilityState === 'hidden') void runtime.flush();
+      else void runtime.api.renewSessionIfNeeded().catch(() => undefined);
+    };
+    const flush = () => { void runtime.flush(); };
+    const online = () => { void runtime.api.renewSessionIfNeeded().catch(() => undefined); };
+    document.addEventListener('visibilitychange', visibility);
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('online', online);
+    return () => {
+      document.removeEventListener('visibilitychange', visibility);
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('online', online);
+    };
+  }, [runtime]);
+  return <RuntimeContext value={runtime}>
+    <QueryClientProvider client={runtime.queryClient}>{children}</QueryClientProvider>
+  </RuntimeContext>;
+}

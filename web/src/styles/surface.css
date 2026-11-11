@@ -1,0 +1,71 @@
+/*
+ * Reading-page surface aliases. These short names used to arrive with the media
+ * stylesheet; after the media client was removed we keep the pure token-mapping
+ * layer here so the shelf, home, search, 我的 and reader keep their colours.
+ * No media behaviour lives in this file.
+ */
+:root {
+  --text: var(--color-ink);
+  --muted: var(--color-muted);
+  --surface: var(--color-surface-2);
+  --border: var(--color-line);
+  --media-paper: var(--color-surface);
+  --media-background: var(--color-bg);
+  --media-accent: var(--color-brand-text);
+  --media-fill: var(--color-brand);
+  --media-on-accent: var(--color-on-brand);
+  --media-selection: var(--color-brand-soft);
+  --media-error-ink: var(--color-danger);
+  --media-error-background: var(--color-danger-soft);
+}
+
+.media-screen {
+  box-sizing: border-box;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 24px 24px 96px;
+  color: var(--text);
+  font-size: var(--text-ui);
+  line-height: 1.5;
+}
+.media-screen h1 { margin: 0; font-size: var(--text-display); font-weight: 600; line-height: 1.4; }
+.media-screen h2 { font-size: var(--text-title); font-weight: 600; }
+.media-screen button, .media-screen input, .media-screen select, .media-screen textarea { font: inherit; color: inherit; }
+.media-screen button { cursor: pointer; }
+.media-screen button:disabled { opacity: .45; cursor: default; }
+.media-screen a { color: var(--media-accent); }
+
+.media-heading {
+  display: flex; align-items: center; gap: 8px; min-height: 49px;
+  margin: 0 0 12px; border-bottom: 1px solid var(--border);
+}
+.media-page-heading { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.media-back-button {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 44px; min-width: 44px; height: 44px; padding: 8px;
+  border: 0; border-radius: var(--radius-sm); background: transparent;
+}
+.media-back-button > .icon { font-size: var(--text-display); }
+.media-error { padding: 12px; border-radius: var(--radius-sm); background: var(--media-error-background); color: var(--media-error-ink); }
+.media-primary {
+  min-height: 40px; padding: 9px 18px; border: 0; border-radius: var(--radius-sm);
+  background: var(--media-fill); color: var(--media-on-accent); font-weight: 600;
+}
+
+/* 我的 -> /me/:panel settings panels */
+.media-settings { max-width: 640px; margin: 0 auto; }
+.media-settings-heading { display: flex; align-items: center; gap: 4px; min-height: 49px; margin: 0 0 6px; }
+.media-settings-heading h1 { margin: 0; }
+.media-account-panel { max-width: 640px; margin: 32px auto; }
+.media-account-avatar {
+  display: grid; place-items: center; width: 60px; height: 60px; border-radius: 50%;
+  background: var(--media-selection); color: var(--media-accent); font-size: 26px;
+}
+.media-account-panel h2 { font-size: var(--text-display); margin: 16px 0 4px; overflow-wrap: anywhere; }
+.media-account-panel p { font-size: var(--text-label); color: var(--muted); overflow-wrap: anywhere; }
+.media-account-panel dl { font-size: var(--text-meta); line-height: 1.8; }
+.media-account-panel dd { margin: 8px 0; overflow-wrap: anywhere; }
+.media-manager-note {
+  padding: 12px 14px; background: var(--surface); border-radius: var(--radius-sm);
+  color: var(--muted); font-size: var(--text-meta); line-height: 1.8; margin: 20px 0;
+}

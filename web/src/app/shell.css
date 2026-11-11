@@ -1,0 +1,122 @@
+/* Reading shell: one navigation for 首页, 书架, 搜索, 书库, 书源 and 我的.
+ * A tab bar up to 700px, a sidebar from 701px up. Colours are the theme's --color-*
+ * tokens (styles/theme-tokens.css), so every theme restyles it. */
+:root { --app-nav-width: 232px; --app-nav-bar: 64px; }
+
+.app-shell { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
+/* Pages were direct children of #app (a flex column that clips); keep exactly that
+ * contract for them one level down. */
+.app-shell-body { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
+
+.app-nav {
+  --nav-ink: var(--color-ink);
+  --nav-muted: var(--color-muted);
+  --nav-line: var(--color-line);
+  --nav-surface: var(--color-surface);
+  --nav-accent: var(--color-brand-text);
+  --nav-soft: var(--color-brand-soft);
+  flex: none;
+  box-sizing: border-box;
+  background: var(--nav-surface);
+  color: var(--nav-ink);
+  border-color: var(--nav-line);
+}
+.app-nav ul { list-style: none; margin: 0; padding: 0; }
+.app-nav a { color: inherit; text-decoration: none; }
+.app-nav a:focus-visible { outline: 2px solid var(--nav-accent); outline-offset: 2px; }
+.app-nav-icon { display: grid; place-items: center; }
+
+/* ---- phone: tab bar ---- */
+@media (max-width: 700px) {
+  .app-nav { order: 2; display: flex; height: calc(var(--app-nav-bar) + env(safe-area-inset-bottom)); padding: 6px 12px env(safe-area-inset-bottom); border-top: 1px solid var(--nav-line); }
+  .app-nav[data-mode='push'] { display: none; }
+  .app-nav-brand, .app-nav-user, .app-nav-search { display: none; }
+  .app-nav-list { display: flex; flex: 1; }
+  .app-nav-list > li { flex: 1; min-width: 0; }
+  .app-nav-item { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; height: 52px; font-size: var(--text-meta); font-weight: 500; color: var(--nav-muted); }
+  .app-nav-item[aria-current='page'] { color: var(--nav-accent); font-weight: 600; }
+  .app-nav-item .app-nav-icon { width: 52px; height: 30px; border-radius: var(--radius-pill); }
+  .app-nav-item[aria-current='page'] .app-nav-icon { background: var(--nav-soft); }
+}
+
+/* ---- desktop: sidebar ---- */
+@media (min-width: 701px) {
+  .app-shell { flex-direction: row; }
+  /* After the page in the DOM (so the phone bar follows the content), before it on screen. */
+  .app-nav { order: -1; display: flex; flex-direction: column; width: var(--app-nav-width); padding: 24px 14px; border-right: 1px solid var(--nav-line); overflow-y: auto; }
+  .app-nav-brand { padding: 0 14px 22px; font-family: 'Songti SC', 'Noto Serif SC', 'Source Han Serif SC', serif; font-size: 26px; font-weight: 700; color: var(--nav-accent); }
+  .app-nav-item { display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 14px; border-radius: var(--radius-md); font-size: var(--text-body); color: var(--nav-ink); }
+  @media (hover: hover) and (pointer: fine) {
+    .app-nav-item:hover:not([aria-current='page']) { background: color-mix(in srgb, var(--color-surface-2) 60%, transparent); }
+  }
+  .app-nav-item[aria-current='page'] { background: var(--nav-soft); color: var(--nav-accent); font-weight: 600; }
+  .app-nav-user { display: flex; align-items: center; gap: 10px; margin-top: auto; padding: 10px 12px; border-radius: var(--radius-lg); background: var(--color-bg); }
+  .app-nav-avatar { display: grid; place-items: center; flex: none; width: 34px; height: 34px; border-radius: 50%; background: var(--color-brand); color: var(--color-on-brand); font-weight: 600; }
+  .app-nav-user-text { min-width: 0; }
+  .app-nav-user-text strong, .app-nav-user-text small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .app-nav-user-text strong { font-size: var(--text-ui); }
+  .app-nav-user-text small { display: flex; align-items: center; gap: 5px; font-size: var(--text-meta); color: var(--nav-muted); }
+  .app-nav-status { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--color-ch-read); }
+  .app-nav-status[data-state='offline'] { background: var(--nav-muted); }
+  .app-nav-status[data-state='error'] { background: var(--color-danger); }
+  .app-nav-search { display: flex; align-items: center; gap: 8px; margin: 0 0 16px; padding: 0 12px; border-radius: var(--radius-md); background: var(--color-surface-2); color: var(--nav-muted); }
+  .app-nav-search input { flex: 1; min-width: 0; height: 40px; border: 0; background: transparent; color: var(--nav-ink); font: inherit; font-size: var(--text-label); outline: none; }
+  .app-nav-search input::-webkit-search-cancel-button { display: none; }
+  .app-nav-search:focus-within { box-shadow: 0 0 0 2px var(--nav-accent); }
+}
+
+/* ---- reading pages wear the theme too; their --reader-* names alias the tokens
+ * (theme-tokens.css). The reader may wear 黑白灰 on its own container, and a
+ * reading paper on its page (--reader-paper / --reader-ink). ---- */
+:is(.shelf-screen, .library-screen, .sources-screen, .home-page) {
+  background: var(--color-bg);
+  color: var(--color-ink);
+}
+.reader-screen {
+  background: var(--reader-paper);
+  color: var(--reader-ink);
+}
+
+/* ---- one page column for the reading tabs ----
+ * 首页, 书架, 搜索 and 我的 share --page-measure / --page-gutter
+ * (styles/reader.css), so switching tabs never moves the content edges. */
+@media (min-width: 701px) {
+  :root { --page-gutter: 32px; }
+}
+.media-screen:is(.home-page, .mine-page, .search-page) {
+  max-width: none;
+  padding-inline: max(var(--page-gutter), calc((100% - var(--page-measure)) / 2));
+}
+/* Phone: the same 20px top as the shelf's header, clear of the notch. */
+@media (max-width: 700px) {
+  .media-screen:is(.home-page, .mine-page, .search-page) { padding-top: calc(20px + var(--safe-top)); }
+  .shelf { padding-inline: calc(var(--page-gutter) - 0.9rem); }
+}
+@media (min-width: 701px) {
+  .shelf { --shelf-measure: var(--collection-measure); }
+  .shelf-head, .shelf-discovery, .shelf-section { width: calc(100% - 2 * var(--page-gutter) + 1.8rem); }
+  .shelf-head { padding-top: 24px; }
+  body[data-app-nav] .media-screen:is(.mine-page, .home-page, .search-page) { padding-top: 24px; }
+}
+/* Between the sidebar breakpoint and 64rem the discovery row is display: contents,
+ * so its two children are bands of their own. */
+@media (min-width: 701px) and (max-width: 63.99rem) {
+  .shelf-links, .shelf-search { width: calc(100% - 2 * var(--page-gutter) + 1.8rem); }
+}
+
+/* ---- reader chrome, V3: a rounded bottom sheet and a quiet top bar ---- */
+.reader-screen .footer {
+  border-top: 0;
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  box-shadow: 0 -8px 30px color-mix(in srgb, var(--color-ink) 10%, transparent);
+}
+.reader-screen .topbar { border-bottom: 1px solid var(--reader-line); box-shadow: none; }
+.reader-screen .reader-actions button[aria-current='true'],
+.reader-screen .reader-actions button:active { color: var(--reader-accent); }
+
+/* Page titles in the serif face, the way the prototype sets them. */
+.shelf-title { font-family: 'Songti SC', 'Noto Serif SC', 'Source Han Serif SC', serif; }
+
+body {
+  background: var(--color-bg);
+}

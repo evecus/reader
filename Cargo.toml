@@ -1,0 +1,66 @@
+[package]
+name = "reader-rs"
+version = "0.1.0"
+edition = "2021"
+description = "reader: self-hosted book library, Rust backend with an embedded web client"
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "reader"
+path = "src/main.rs"
+
+[dependencies]
+# --- async runtime / HTTP ---
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["multipart"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+async-stream = "0.3"
+
+# --- serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- database (on-disk format identical to node:sqlite) ---
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# --- crypto / auth ---
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+scrypt = "0.11"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+
+# --- book formats ---
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.36"
+encoding_rs = "0.8"
+mime_guess = "2"
+
+# --- archives for plugin install / backup ---
+flate2 = "1"
+tar = "0.4"
+
+# --- HTTP client (OPDS / TTS / AI / plugin host.fetch) ---
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
+
+# --- embedded web client ---
+rust-embed = { version = "8", features = ["debug-embed"] }
+
+# --- QuickJS plugin runtime ---
+rquickjs = "0.14"
+
+# --- logging ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- misc ---
+percent-encoding = "2"
+bytes = "1.12.1"
+chrono = "0.4.45"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

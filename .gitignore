@@ -1,0 +1,8 @@
+# Build outputs. web/dist/index.html stays tracked as the rust-embed compile
+# placeholder; CI/Docker regenerate the full bundle with `npm run build`.
+/target/
+/web/dist/assets/
+/web/dist/icons/
+/web/dist/startup/
+/web/dist/manifest.webmanifest
+/web/dist/sw.js
