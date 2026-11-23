@@ -6,7 +6,7 @@ description = "Server-side Legado reader: Legado book sources, Rust engine, embe
 license = "AGPL-3.0-or-later"
 
 [[bin]]
-name = "legado-server"
+name = "reader"
 path = "src/main.rs"
 
 [dependencies]
