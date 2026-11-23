@@ -14,6 +14,12 @@ pub struct JsContext {
     pub chapter_title: String,
     pub variables: HashMap<String, String>,
     pub fetch: Option<std::sync::Arc<dyn Fn(&str, &str) -> String + Send + Sync>>,
+    /// jsUrl 专用：搜索关键字、页码、书源持久化变量 JSON
+    pub key: String,
+    pub page: i32,
+    pub source_variables: String,
+    /// 书源登录信息（getLoginInfoMap 返回）
+    pub login_info: HashMap<String, String>,
 }
 
 impl Default for JsContext {
@@ -22,6 +28,8 @@ impl Default for JsContext {
             js_lib: String::new(), result: String::new(), base_url: String::new(),
             source_url: String::new(), source_name: String::new(), book_name: String::new(),
             chapter_title: String::new(), variables: HashMap::new(), fetch: None,
+            key: String::new(), page: 1, source_variables: "{}".into(),
+            login_info: HashMap::new(),
         }
     }
 }
@@ -43,17 +51,28 @@ fn js_value_to_string(v: &Value<'_>) -> String {
 
 /// 执行 JS 表达式，返回结果字符串
 pub fn eval(expr: &str, ctx: &JsContext) -> AppResult<String> {
+    eval_inner(expr, ctx, true)
+}
+
+/// 规则求值：表达式包进 IIFE，兼容 @js: 复杂的 replace/正则链（返回表达式结果）
+fn eval_inner(expr: &str, ctx: &JsContext, script_mode: bool) -> AppResult<String> {
     let runtime = Runtime::new().map_err(|e| AppError::internal(format!("QuickJS runtime: {e}")))?;
     let context = Context::full(&runtime).map_err(|e| AppError::internal(format!("QuickJS context: {e}")))?;
 
     context.with(|js| {
         inject_bindings(&js, ctx)?;
-        let script = format!(
-            "{}\n;var __legado_result = (function(){{ return ({}); }})();\n__legado_result;",
-            ctx.js_lib, expr
-        );
-        let val: Value = js.eval(script)
-            .map_err(|e| AppError::bad_request(format!("JS 执行失败: {}", format_js_err(&e))))?;
+        let script = if script_mode {
+            // jsUrl 多语句脚本：eval 返回最后一条表达式的值
+            let expr_json = serde_json::to_string(expr).unwrap_or_else(|_| "\"\"".into());
+            format!("{}\n;var __legado_result = eval({});\n__legado_result;", ctx.js_lib, expr_json)
+        } else {
+            // 规则表达式：IIFE 包装
+            format!("{}\n;var __legado_result = (function(){{ return ({}); }})();\n__legado_result;", ctx.js_lib, expr)
+        };
+        let val: Value = js.eval(script).map_err(|e| {
+            let detail = catch_js_error(&js);
+            AppError::bad_request(format!("JS 执行失败: {} · {}", format_js_err(&e), detail))
+        })?;
         Ok(js_value_to_string(&val))
     })
 }
@@ -63,7 +82,41 @@ pub fn eval_statement(expr: &str, ctx: &JsContext) -> AppResult<String> {
     eval(expr, ctx)
 }
 
+/// 执行多语句脚本（jsUrl / <js>...</js> 前缀），返回最后表达式的值
+pub fn eval_script(expr: &str, ctx: &JsContext) -> AppResult<String> {
+    eval_inner(expr, ctx, true)
+}
+
+/// 求值 jsUrl：解析 <js>...</js> 或 @js: 包装的脚本，返回最终 URL 字符串。
+/// 非脚本返回 None。
+pub fn eval_js_url(raw: &str, ctx: &JsContext) -> AppResult<Option<String>> {
+    let t = raw.trim();
+    let expr = if t.to_ascii_lowercase().starts_with("<js>") && t.to_ascii_lowercase().ends_with("</js>") {
+        t[4..t.len() - 5].trim()
+    } else if t.to_ascii_lowercase().starts_with("@js:") {
+        t[4..].trim()
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(eval_inner(expr, ctx, true)?))
+}
+
 fn format_js_err(e: &rquickjs::Error) -> String { format!("{e}") }
+
+/// 取出 QuickJS 抛出的异常详情（message / stack），便于定位脚本错误
+fn catch_js_error(js: &rquickjs::Ctx<'_>) -> String {
+    let exc = js.catch();
+    if let Some(obj) = exc.as_object() {
+        let msg = obj.get::<_, Value>("message").ok()
+            .map(|v| js_value_to_string(&v)).unwrap_or_default();
+        let stack = obj.get::<_, Value>("stack").ok()
+            .map(|v| js_value_to_string(&v)).unwrap_or_default();
+        if !msg.is_empty() {
+            return if stack.is_empty() { msg } else { format!("{} | {}", msg, stack.chars().take(300).collect::<String>()) };
+        }
+    }
+    js_value_to_string(&exc)
+}
 
 fn inject_bindings(js: &rquickjs::Ctx<'_>, jc: &JsContext) -> AppResult<()> {
     js.globals().set("result", jc.result.clone()).ok();
@@ -133,14 +186,48 @@ fn inject_bindings(js: &rquickjs::Ctx<'_>, jc: &JsContext) -> AppResult<()> {
     );
     let _: Result<Value, _> = js.eval(bootstrap);
 
-    // cookie / cache / source 占位
+    // jsUrl 变量：key / page / result
+    js.globals().set("key", jc.key.clone()).ok();
+    js.globals().set("page", jc.page).ok();
+
+    // JSON 规则中的内联 {{$.field}}：注入 $ = JSON.parse(result)（容错非 JSON）
+    let dollar_bootstrap = format!(
+        "var $ = (function(){{ try{{ return JSON.parse({}); }}catch(e){{ return {{}}; }} }})();",
+        serde_json::to_string(&jc.result).unwrap_or_else(|_| "\"\"".into())
+    );
+    let _: Result<Value, _> = js.eval(dollar_bootstrap);
+
+    // cookie / cache 占位
     let obj = Object::new(js.clone()).ok();
     if let Some(o) = obj {
         js.globals().set("cookie", o.clone()).ok();
         js.globals().set("cache", o).ok();
     }
+
+    // source 对象：getVariable / getLoginInfoMap / setVariable / 书源信息等
     let source = Object::new(js.clone()).ok();
-    if let Some(s) = source { js.globals().set("source", s).ok(); }
+    if let Some(s) = source {
+        s.set("bookSourceUrl", jc.source_url.clone()).ok();
+        s.set("bookSourceName", jc.source_name.clone()).ok();
+        js.globals().set("source", s).ok();
+
+        // 用 JS bootstrap 定义方法，避免 Rust 闭包跨 eval 共享状态的问题
+        let vars_json = serde_json::to_string(&jc.source_variables).unwrap_or_else(|_| "\"{}\"".into());
+        let login_json = serde_json::to_string(&jc.login_info).unwrap_or_else(|_| "{}".into());
+        let source_bootstrap = format!(
+            "var __SRC_VARS = {}; \
+             var __LOGIN = {}; \
+             source.getVariable = function() {{ return __SRC_VARS; }}; \
+             source.setVariable = function(v) {{ __SRC_VARS = String(v); }}; \
+             source.getLoginInfoMap = function() {{ \
+               return {{ get: function(k) {{ \
+                 return Object.prototype.hasOwnProperty.call(__LOGIN, k) ? __LOGIN[k] : null; \
+               }} }}; \
+             }};",
+            vars_json, login_json
+        );
+        let _: Result<Value, _> = js.eval(source_bootstrap);
+    }
 
     Ok(())
 }

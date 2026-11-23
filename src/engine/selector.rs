@@ -140,7 +140,16 @@ pub fn json_select(json: &Value, path: &str) -> EvalValue {
         }
         current = next;
     }
-    if current.len() == 1 { EvalValue::Json(current.remove(0)) }
+    if current.len() == 1 {
+        let v = current.remove(0);
+        // JSONPath 根 `$` 指向数组时，展开为列表（Legado 书源常见写法：bookList="$"）
+        if path.trim() == "$" {
+            if let Value::Array(arr) = v {
+                return EvalValue::List(arr.into_iter().map(EvalValue::Json).collect());
+            }
+        }
+        EvalValue::Json(v)
+    }
     else { EvalValue::List(current.into_iter().map(EvalValue::Json).collect()) }
 }
 

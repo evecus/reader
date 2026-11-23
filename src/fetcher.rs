@@ -101,6 +101,56 @@ impl Fetcher {
             .ok().and_then(|r| r.bytes().ok())
             .map(|b| decode_bytes(&b)).unwrap_or_default()
     }
+
+    /// 通用同步请求：支持 `url,{"method":"POST","body":"...","headers":{...}}` 选项语法。
+    /// 供 JS java.ajax 使用，返回响应文本。
+    pub fn request_with_options_blocking(raw: &str, source_headers: Option<&str>) -> String {
+        let (url, opts) = split_options(raw);
+        let opts: Option<serde_json::Value> = opts.and_then(|o| serde_json::from_str(&o).ok());
+        let mut hm = Self::parse_headers(source_headers, &url);
+        let mut method = "GET".to_string();
+        let mut body = String::new();
+        if let Some(o) = &opts {
+            if let Some(m) = o.get("method").and_then(|v| v.as_str()) { method = m.to_uppercase(); }
+            if let Some(b) = o.get("body") {
+                body = match b {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+            }
+            if let Some(h) = o.get("headers").and_then(|v| v.as_object()) {
+                for (k, v) in h {
+                    if let (Ok(name), Ok(val)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_str(v.as_str().unwrap_or(&v.to_string())),
+                    ) { hm.insert(name, val); }
+                }
+            }
+        }
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .danger_accept_invalid_certs(true).build() {
+            Ok(c) => c, Err(_) => return String::new(),
+        };
+        let result = if method == "POST" {
+            client.post(&url).headers(hm).body(body).send()
+        } else {
+            client.get(&url).headers(hm).send()
+        };
+        result.ok().and_then(|r| r.bytes().ok()).map(|b| decode_bytes(&b)).unwrap_or_default()
+    }
+}
+
+/// 拆分 `url,{"...":...}` → (url, Some(options_json))
+fn split_options(raw: &str) -> (String, Option<String>) {
+    let s = raw.trim();
+    if let Some(idx) = s.rfind(",{") {
+        let candidate = &s[idx + 1..];
+        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+            return (s[..idx].trim().to_string(), Some(candidate.to_string()));
+        }
+    }
+    (s.to_string(), None)
 }
 
 /// 编码检测：优先 UTF-8，失败则 GBK

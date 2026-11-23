@@ -31,12 +31,16 @@ impl RuleContext {
             js_lib: self.js_lib.clone(),
             result: result.into(),
             base_url: self.base_url.clone(),
-            source_url: String::new(),
-            source_name: String::new(),
+            source_url: self.variables.get("sourceUrl").cloned().unwrap_or_default(),
+            source_name: self.variables.get("sourceName").cloned().unwrap_or_default(),
             book_name: self.variables.get("bookName").cloned().unwrap_or_default(),
             chapter_title: self.chapter_title.clone(),
             variables: self.variables.clone(),
             fetch: self.fetch.clone(),
+            key: self.variables.get("key").cloned().unwrap_or_default(),
+            page: self.variables.get("page").and_then(|v| v.parse().ok()).unwrap_or(1),
+            source_variables: self.variables.get("sourceVariables").cloned().unwrap_or_else(|| "{}".into()),
+            login_info: HashMap::new(),
         }
     }
 
@@ -58,8 +62,20 @@ impl RuleContext {
         let pieces: Vec<RulePiece> = parse_rule(rule).pieces;
         let mut acc: Vec<String> = Vec::new();
         for piece in &pieces {
-            let selector = self.expand_segments(piece)?;
-            let els = self.select_elements(&selector, piece.mode)?;
+            let els = if let Some(js) = &piece.js_prefix {
+                // <js>...</js> 前缀：先执行脚本，结果作为后续选择器的求值内容
+                let jc = self.js_ctx(self.html.clone());
+                let result = js::eval_script(js, &jc)?;
+                let mut sub = RuleContext::new(result, self.base_url.clone());
+                sub.js_lib = self.js_lib.clone();
+                sub.variables = self.variables.clone();
+                sub.fetch = self.fetch.clone();
+                let selector = sub.expand_segments(piece)?;
+                sub.select_elements(&selector, piece.mode)?
+            } else {
+                let selector = self.expand_segments(piece)?;
+                self.select_elements(&selector, piece.mode)?
+            };
             for (k, expr) in &piece.put_map {
                 let v = self.get_string(expr)?;
                 self.variables.insert(k.clone(), v);
@@ -69,15 +85,34 @@ impl RuleContext {
         Ok(acc)
     }
 
-    /// 从元素 HTML 列表取属性/文本
+    /// 从元素列表取字段值
     pub fn element_values(&mut self, elements: &[String], rule: &str) -> AppResult<Vec<String>> {
+        if rule.is_empty() { return Ok(vec![]); }
+        let is_json = rule == "$" || rule.starts_with("$.") || rule.starts_with("$[")
+            || rule.to_ascii_lowercase().starts_with("@json:");
+        let lower = rule.to_ascii_lowercase();
+        let is_js = lower.starts_with("<js>") && lower.ends_with("</js>");
+        if is_json || is_js {
+            // JSON 元素 / 纯 JS 规则：用完整规则引擎（支持 $.field / <js> 脚本）
+            let mut out = Vec::new();
+            for html in elements {
+                let mut sub = RuleContext::new(html.clone(), self.base_url.clone());
+                sub.js_lib = self.js_lib.clone();
+                sub.variables = self.variables.clone();
+                sub.fetch = self.fetch.clone();
+                let values = sub.get_string_list(rule)?;
+                for v in values { if !v.is_empty() { out.push(v); } }
+                for (k, v) in sub.variables { self.variables.insert(k, v); }
+            }
+            return Ok(out);
+        }
+        // HTML/CSS 元素：走属性/文本提取器
         if let Some(idx) = rule.find("@js:") {
             let base_rule = &rule[..idx];
             let js_expr = &rule[idx + 4..];
             let mut out = Vec::new();
             for html in elements {
-                let base_vals = element_attr_or_text(html, base_rule);
-                for v in base_vals {
+                for v in element_attr_or_text(html, base_rule) {
                     let jc = self.js_ctx(&v);
                     let r = js::eval(js_expr, &jc)?;
                     if !r.is_empty() { out.push(r); }
@@ -152,7 +187,7 @@ impl RuleContext {
     fn eval_selector(&mut self, selector: &str, mode: Mode) -> AppResult<EvalValue> {
         match mode {
             Mode::Js => {
-                let jc = self.js_ctx(String::new());
+                let jc = self.js_ctx(self.html.clone());
                 Ok(EvalValue::Str(js::eval(selector, &jc)?))
             }
             Mode::Json => {
@@ -162,10 +197,19 @@ impl RuleContext {
             Mode::XPath => xpath_select(&self.html, selector),
             Mode::Regex => regex_extract(&self.html, selector, ""),
             Mode::WebJs => {
-                let jc = self.js_ctx(String::new());
+                let jc = self.js_ctx(self.html.clone());
                 Ok(EvalValue::Str(js::eval(selector, &jc)?))
             }
-            Mode::Default => css_select(&self.html, selector),
+            Mode::Default => {
+                match css_select(&self.html, selector) {
+                    Ok(v) => Ok(v),
+                    Err(_) => {
+                        // 内联 {{...}} 求值后可能是纯文本（如 "{{$.origin}} {{$.kind}}"），
+                        // 不是合法 CSS 选择器，此时直接把展开结果作为值返回
+                        Ok(EvalValue::Str(selector.to_string()))
+                    }
+                }
+            }
         }
     }
 
@@ -175,7 +219,7 @@ impl RuleContext {
             match seg {
                 Segment::Text(t) => s.push_str(t),
                 Segment::Js(expr) => {
-                    let jc = self.js_ctx(String::new());
+                    let jc = self.js_ctx(self.html.clone());
                     s.push_str(&js::eval(expr, &jc)?);
                 }
                 Segment::GetVar(name) => {
@@ -195,7 +239,17 @@ impl RuleContext {
                 css_elements(&self.html, sel).map_err(AppError::bad_request)
             }
             Mode::XPath => xpath_elements(&self.html, selector),
-            _ => Ok(vec![]),
+            Mode::Json => {
+                let json: Value = serde_json::from_str(&self.html).unwrap_or(Value::Null);
+                let val = json_select(&json, selector);
+                Ok(val.as_list().iter().map(|v| v.as_str()).collect())
+            }
+            Mode::Js | Mode::WebJs => {
+                let jc = self.js_ctx(String::new());
+                let r = js::eval(selector, &jc)?;
+                if r.is_empty() { Ok(vec![]) } else { Ok(vec![r]) }
+            }
+            Mode::Regex => Ok(vec![]),
         }
     }
 }

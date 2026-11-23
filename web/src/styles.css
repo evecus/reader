@@ -235,6 +235,7 @@ input, textarea { font-family: inherit; font-size: inherit; }
 .import-url { width: 100%; border: 1px solid var(--divider); border-radius: 6px; padding: 10px; outline: none; font-size: 14px; }
 .import-url:focus { border-color: var(--primary); }
 .import-note { font-size: 12px; color: var(--text-secondary); margin-top: 8px; }
+.search-errors { background: rgba(211, 47, 47, .08); border: 1px solid rgba(211, 47, 47, .2); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; font-size: 12px; color: var(--accent); line-height: 1.6; word-break: break-all; }
 
 /* 分类标签 */
 .chips { display: flex; gap: 8px; overflow-x: auto; padding: 4px 0 12px; }

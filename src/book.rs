@@ -6,7 +6,23 @@ use crate::error::{AppError, AppResult};
 use crate::fetcher::Fetcher;
 use crate::model::{Book, BookChapter, BookSource};
 use futures::future::join_all;
+use serde_json::Value;
 use std::sync::Arc;
+
+/// 拆分 Legado jsUrl 返回值：`url,{"headers":{...}}` → (url, Some(headers_json))
+/// 也兼容 `url,{"method":"POST",...}` 等其它选项（目前仅消费 headers）。
+fn parse_url_with_options(raw: &str) -> (String, Option<String>) {
+    let s = raw.trim();
+    // 从后往前找第一个顶层 "," 后跟 { 的位置
+    if let Some(idx) = s.rfind(",{") {
+        let url = s[..idx].trim().to_string();
+        let opts = &s[idx + 1..];
+        if serde_json::from_str::<Value>(opts).is_ok() {
+            return (url, Some(opts.to_string()));
+        }
+    }
+    (s.to_string(), None)
+}
 
 pub struct BookService {
     pub fetcher: Arc<Fetcher>,
@@ -21,9 +37,39 @@ impl BookService {
         let fetcher = self.fetcher.clone();
         let header = source.header.clone().unwrap_or_default();
         ctx.fetch = Some(Arc::new(move |url: &str, _h: &str| {
-            Fetcher::get_blocking(url, Some(&header))
+            Fetcher::request_with_options_blocking(url, Some(&header))
         }));
         ctx
+    }
+
+    /// 构造带书源绑定的 JS 上下文（供 jsUrl / 规则求值共用）
+    fn js_context(&self, source: &BookSource) -> crate::engine::js::JsContext {
+        use crate::engine::js::JsContext;
+        let fetcher = self.fetcher.clone();
+        let header = source.header.clone().unwrap_or_default();
+        JsContext {
+            js_lib: source.js_lib.clone().unwrap_or_default(),
+            source_url: source.book_source_url.clone(),
+            source_name: source.book_source_name.clone(),
+            fetch: Some(std::sync::Arc::new(move |url: &str, _h: &str| {
+                Fetcher::request_with_options_blocking(url, Some(&header))
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// 解析入口 URL：支持普通 URL / {{key}}{{page}} / <js> 脚本
+    fn resolve_url(&self, source: &BookSource, raw: &str, key: Option<&str>, page: i32) -> AppResult<String> {
+        if raw.trim().to_ascii_lowercase().starts_with("<js>")
+            || raw.trim().to_ascii_lowercase().starts_with("@js:") {
+            let mut ctx = self.js_context(source);
+            ctx.key = key.unwrap_or("").to_string();
+            ctx.page = page;
+            if let Some(u) = crate::engine::js::eval_js_url(raw, &ctx)? {
+                return Ok(u);
+            }
+        }
+        Ok(Fetcher::prepare_url(raw, key, Some(page)))
     }
 
     /// 搜索（单源）
@@ -31,16 +77,37 @@ impl BookService {
         let search_url = source.search_url.as_ref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| AppError::bad_request("书源搜索地址为空"))?;
-        let url = Fetcher::prepare_url(search_url, Some(key), Some(page));
-        let (body, final_url) = self.fetcher.get(&url, source.header.as_deref()).await?;
+        let url = self.resolve_url(source, search_url, Some(key), page)?;
+        let (body, final_url) = self.fetch_url(&url, source).await?;
         self.parse_book_list(source, body, final_url, true)
     }
 
     /// 发现（分类/榜单）
     pub async fn explore(&self, source: &BookSource, url: &str, page: i32) -> AppResult<Vec<Book>> {
-        let url = Fetcher::prepare_url(url, None, Some(page));
-        let (body, final_url) = self.fetcher.get(&url, source.header.as_deref()).await?;
+        let url = self.resolve_url(source, url, None, page)?;
+        let (body, final_url) = self.fetch_url(&url, source).await?;
         self.parse_book_list(source, body, final_url, false)
+    }
+
+    /// 请求 URL，兼容 Legado 的 `url,{"headers":{...}}` 选项语法
+    async fn fetch_url(&self, raw: &str, source: &BookSource) -> AppResult<(String, String)> {
+        let (url, extra_headers) = parse_url_with_options(raw);
+        let mut header = source.header.clone().unwrap_or_default();
+        if let Some(extra_opts) = extra_headers {
+            // 选项对象形如 {"headers":{...},"method":"GET"}，提取其中的 headers map
+            let add = serde_json::from_str::<Value>(&extra_opts).ok()
+                .and_then(|v| v.get("headers").cloned())
+                .filter(|h| h.is_object());
+            if let Some(add) = add {
+                let base = serde_json::from_str::<Value>(&header).ok().unwrap_or(Value::Object(Default::default()));
+                let mut base = base.as_object().cloned().unwrap_or_default();
+                if let Some(m) = add.as_object() {
+                    for (k, v) in m { base.insert(k.clone(), v.clone()); }
+                }
+                header = serde_json::to_string(&Value::Object(base)).unwrap_or(header);
+            }
+        }
+        self.fetcher.get(&url, Some(&header)).await
     }
 
     /// 多源并发搜索

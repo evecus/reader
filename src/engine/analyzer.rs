@@ -41,6 +41,8 @@ pub struct RulePiece {
     pub replace_first: bool,           // ## 后第 3 段存在
     /// 逻辑连接符：本组内部的连接方式（&& / || / %%），由 split_logic 决定
     pub connectors: Vec<String>,
+    /// <js>...</js> 前缀脚本：先执行得到字符串，再作为后续规则的求值内容
+    pub js_prefix: Option<String>,
 }
 
 impl RulePiece {
@@ -151,12 +153,30 @@ fn split_logic(s: &str) -> (Vec<String>, Vec<String>) {
 fn parse_piece(raw: &str) -> RulePiece {
     let mut s = raw.trim().to_string();
     let mut mode = Mode::Default;
+    let mut js_prefix: Option<String> = None;
+
+    // <js>...</js> 前缀脚本（后面还接选择器，如 <js>...</js>$[*]）
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("<js>") {
+        if let Some(end) = lower.find("</js>") {
+            let body = s[4..end].to_string();
+            let rest = s[end + 5..].trim().to_string();
+            if !rest.is_empty() {
+                js_prefix = Some(body);
+                s = rest;
+            } else {
+                mode = Mode::Js;
+                s = body;
+            }
+        }
+    }
 
     // 模式前缀识别
-    if s.to_ascii_lowercase().starts_with("@js:") {
+    let lower = s.to_ascii_lowercase();
+    if mode != Mode::Js && lower.starts_with("@js:") {
         mode = Mode::Js;
         s = s[4..].to_string();
-    } else if s.len() >= 2 && s[..2].eq_ignore_ascii_case("@c") && s.to_ascii_lowercase().starts_with("@css:") {
+    } else if s.len() >= 2 && s[..2].eq_ignore_ascii_case("@c") && lower.starts_with("@css:") {
         mode = Mode::Default;
         s = s[5..].to_string();
     } else if s.starts_with("@@") {
@@ -168,7 +188,7 @@ fn parse_piece(raw: &str) -> RulePiece {
     } else if s.to_ascii_lowercase().starts_with("@json:") {
         mode = Mode::Json;
         s = s[6..].to_string();
-    } else if s.starts_with("$.") || s.starts_with("$[") {
+    } else if s == "$" || s.starts_with("$.") || s.starts_with("$[") {
         mode = Mode::Json;
     } else if s.starts_with('/') {
         mode = Mode::XPath;
@@ -201,7 +221,7 @@ fn parse_piece(raw: &str) -> RulePiece {
 
     RulePiece {
         mode, segments, put_map, replace_regex, replacement, replace_first,
-        connectors: Vec::new(),
+        connectors: Vec::new(), js_prefix,
     }
 }
 

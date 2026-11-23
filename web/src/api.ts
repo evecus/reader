@@ -40,7 +40,7 @@ export const api = {
     return req<{ books: Book[]; errors: { source: string; error: string }[] }>(`/api/search?${q}`)
   },
   explore: (origin: string, url: string, page = 1) =>
-    req<{ books: Book[] }>(`/api/explore?${new URLSearchParams({ origin, url, page: String(page) })}`),
+    req<{ books: Book[]; errors?: { source: string; error: string }[] }>(`/api/explore?${new URLSearchParams({ origin, url, page: String(page) })}`),
 
   bookInfo: (origin: string, url: string) =>
     req<Book>(`/api/book/info?${new URLSearchParams({ origin, url })}`),
