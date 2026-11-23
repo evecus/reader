@@ -218,6 +218,23 @@ input, textarea { font-family: inherit; font-size: inherit; }
 .dialog textarea:focus { border-color: var(--primary); }
 .dialog-actions { display: flex; gap: 10px; margin-top: 14px; }
 .dialog-actions .btn { flex: 1; }
+.dialog-head { display: flex; align-items: center; margin-bottom: 14px; }
+.dialog-head h2 { flex: 1; margin: 0; }
+
+/* 书源导入：本地文件 / 远程链接 */
+.import-tabs { display: flex; gap: 4px; padding: 3px; background: var(--bg); border: 1px solid var(--divider); border-radius: 8px; margin-bottom: 14px; }
+.import-tab { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px; border-radius: 6px; font-size: 13px; color: var(--text-secondary); }
+.import-tab.active { background: var(--surface); color: var(--primary-dark); font-weight: 600; box-shadow: var(--shadow); }
+.import-tab svg { width: 16px; height: 16px; }
+.file-drop { border: 2px dashed var(--divider); border-radius: 10px; padding: 30px 16px; text-align: center; color: var(--text-secondary); cursor: pointer; transition: border-color .15s, background .15s; }
+.file-drop:hover, .file-drop.dragging { border-color: var(--primary); background: rgba(121, 85, 72, .06); }
+.file-drop-icon { width: 34px; height: 34px; color: var(--primary-light); margin-bottom: 10px; }
+.file-name { font-size: 14px; color: var(--text); word-break: break-all; }
+.file-hint { font-size: 12px; margin-top: 6px; }
+.import-tip { font-size: 13px; color: var(--text-secondary); margin-bottom: 10px; }
+.import-url { width: 100%; border: 1px solid var(--divider); border-radius: 6px; padding: 10px; outline: none; font-size: 14px; }
+.import-url:focus { border-color: var(--primary); }
+.import-note { font-size: 12px; color: var(--text-secondary); margin-top: 8px; }
 
 /* 分类标签 */
 .chips { display: flex; gap: 8px; overflow-x: auto; padding: 4px 0 12px; }

@@ -20,3 +20,5 @@ export const IconClose = (p: SVGProps<SVGSVGElement>) => <svg {...base(p)}><path
 export const IconCheck = (p: SVGProps<SVGSVGElement>) => <svg {...base(p)}><path d="m20 6-11 11-5-5"/></svg>
 export const IconMenu = (p: SVGProps<SVGSVGElement>) => <svg {...base(p)}><path d="M3 12h18M3 6h18M3 18h18"/></svg>
 export const IconBook = (p: SVGProps<SVGSVGElement>) => <svg {...base(p)}><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+export const IconUpload = (p: SVGProps<SVGSVGElement>) => <svg {...base(p)}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+export const IconLink = (p: SVGProps<SVGSVGElement>) => <svg {...base(p)}><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
