@@ -4,7 +4,8 @@ use crate::cookie::CookieStore;
 use crate::engine::analyzer::{parse_rule, Mode, ParsedRule, RulePiece, Segment};
 use crate::engine::js::{self, new_var_store, JsContext, VarStore};
 use crate::engine::selector::{apply_replace, css_select, json_select, regex_extract};
-use crate::engine::value::{css_elements, element_attr_or_text, chained_attr_or_text, EvalValue};
+use crate::engine::jsoup;
+use crate::engine::value::{css_elements, EvalValue};
 use crate::engine::xpath::{xpath_elements, xpath_select};
 use crate::error::{AppError, AppResult};
 use serde_json::Value;
@@ -15,7 +16,8 @@ pub struct RuleContext {
     pub js_lib: String,
     /// 与 JS 层共享的变量表（java.put / source.setVariable / 规则 @put 共用）
     pub variables: VarStore,
-    pub fetch: Option<std::sync::Arc<dyn Fn(&str, &str) -> String + Send + Sync>>,
+    pub fetch: Option<crate::engine::js::JsFetchFn>,
+    pub webview: Option<crate::engine::js::JsWebviewFn>,
     pub cookies: CookieStore,
     pub chapter_title: String,
 }
@@ -24,7 +26,7 @@ impl RuleContext {
     pub fn new(html: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             html: html.into(), base_url: base_url.into(), js_lib: String::new(),
-            variables: new_var_store(), fetch: None, cookies: CookieStore::new(),
+            variables: new_var_store(), fetch: None, webview: None, cookies: CookieStore::new(),
             chapter_title: String::new(),
         }
     }
@@ -57,6 +59,7 @@ impl RuleContext {
             chapter_title: self.chapter_title.clone(),
             variables: self.variables.clone(),
             fetch: self.fetch.clone(),
+            webview: self.webview.clone(),
             cookies: self.cookies.clone(),
             key: self.var("key").unwrap_or_default(),
             page: self.var("page").and_then(|v| v.parse().ok()).unwrap_or(1),
@@ -98,6 +101,7 @@ impl RuleContext {
                 sub.js_lib = self.js_lib.clone();
                 sub.variables = self.variables.clone();
                 sub.fetch = self.fetch.clone();
+                sub.webview = self.webview.clone();
                 sub.cookies = self.cookies.clone();
                 let selector = sub.expand_segments(piece)?;
                 sub.select_elements(&selector, piece.mode)?
@@ -129,6 +133,7 @@ impl RuleContext {
                 sub.js_lib = self.js_lib.clone();
                 sub.variables = self.variables.clone(); // 共享同一张表，JS 写入自动可见
                 sub.fetch = self.fetch.clone();
+                sub.webview = self.webview.clone();
                 sub.cookies = self.cookies.clone();
                 let values = sub.get_string_list(rule)?;
                 for v in values { if !v.is_empty() { out.push(v); } }
@@ -141,7 +146,7 @@ impl RuleContext {
             let js_expr = &rule[idx + 4..];
             let mut out = Vec::new();
             for html in elements {
-                for v in element_attr_or_text(html, base_rule) {
+                for v in jsoup::result_list(html, base_rule) {
                     let jc = self.js_ctx(&v);
                     let r = js::eval(js_expr, &jc)?;
                     if !r.is_empty() { out.push(r); }
@@ -150,7 +155,7 @@ impl RuleContext {
             return Ok(out);
         }
         let mut out = Vec::new();
-        for html in elements { out.extend(chained_attr_or_text(html, rule)); }
+        for html in elements { out.extend(jsoup::result_list(html, rule)); }
         Ok(out)
     }
 
@@ -214,6 +219,14 @@ impl RuleContext {
             return Ok(EvalValue::List(out));
         }
 
+        // Legado：默认模式下规则含 {{js}} / @get 时整体按 Regex 模式处理，
+        // 内联求值后的文本就是结果本身（不再当选择器）。
+        let has_inline = piece.segments.iter()
+            .any(|s| matches!(s, Segment::Js(_) | Segment::GetVar(_)));
+        if has_inline && piece.mode == Mode::Default {
+            return Ok(EvalValue::Str(raw_selector));
+        }
+
         self.eval_selector(&raw_selector, piece.mode)
     }
 
@@ -234,6 +247,13 @@ impl RuleContext {
                 Ok(EvalValue::Str(js::eval(selector, &jc)?))
             }
             Mode::Default => {
+                // Legado 默认语法（class./tag./id./children/索引 + CSS 回退）
+                Ok(EvalValue::List(
+                    jsoup::result_list(&self.html, selector)
+                        .into_iter().map(EvalValue::Str).collect(),
+                ))
+            }
+            Mode::Css => {
                 match css_select(&self.html, selector) {
                     Ok(v) => Ok(v),
                     Err(_) => {
@@ -267,9 +287,9 @@ impl RuleContext {
     fn select_elements(&self, selector: &str, mode: Mode) -> AppResult<Vec<String>> {
         if selector.is_empty() { return Ok(vec![]); }
         match mode {
-            Mode::Default => {
-                let sel = selector.trim_start_matches("@CSS:").trim_start_matches("@@");
-                css_elements(&self.html, sel).map_err(AppError::bad_request)
+            Mode::Default => Ok(jsoup::elements(&self.html, selector)),
+            Mode::Css => {
+                css_elements(&self.html, selector.trim()).map_err(AppError::bad_request)
             }
             Mode::XPath => xpath_elements(&self.html, selector),
             Mode::Json => {
@@ -342,9 +362,9 @@ mod tests {
     #[test]
     fn chained_text_rule() {
         // a@text 多步链：从 <div><a>标题</a></div> 中取 a 的文本
-        let out = chained_attr_or_text("<div><a href='/x'>标题</a></div>", "a@text");
+        let out = jsoup::result_list("<div><a href='/x'>标题</a></div>", "a@text");
         assert_eq!(out, vec!["标题"]);
-        let out2 = chained_attr_or_text("<div><a href='/x'>标题</a></div>", "a@href");
+        let out2 = jsoup::result_list("<div><a href='/x'>标题</a></div>", "a@href");
         assert_eq!(out2, vec!["/x"]);
     }
 

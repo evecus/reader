@@ -211,7 +211,11 @@ async fn run_download(
     }
 
     // 3. 并发逐章下载（buffer_unordered 限制并发）
-    let results = stream::iter(chapters.into_iter().map(|ch| {
+    let next_urls: Vec<Option<String>> = (0..chapters.len())
+        .map(|i| chapters.get(i + 1).map(|c| c.url.clone()))
+        .collect();
+    let results = stream::iter(chapters.into_iter().enumerate().map(|(idx, ch)| {
+        let next_url = next_urls[idx].clone();
         let db = db.clone();
         let books = books.clone();
         let source = source.clone();
@@ -226,7 +230,7 @@ async fn run_download(
             if let Ok(Some(_)) = db.get_cached(&book_url, &ch.url) {
                 return (false, true);
             }
-            match books.content(&source, &book, &ch).await {
+            match books.content_with_next(&source, &book, &ch, next_url.as_deref()).await {
                 Ok(content) => {
                     let cached = CachedChapter {
                         book_url: book_url.clone(),

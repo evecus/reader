@@ -176,7 +176,7 @@ async fn chapters(State(s): State<Arc<AppState>>, Query(p): Query<ChaptersParams
 }
 
 #[derive(Debug, Deserialize)]
-struct ContentParams { origin: String, url: String, book_url: String, title: Option<String> }
+struct ContentParams { origin: String, url: String, book_url: String, title: Option<String>, next_url: Option<String> }
 
 async fn content(State(s): State<Arc<AppState>>, Query(p): Query<ContentParams>) -> AppResult<Json<Value>> {
     let sources = s.db.list_sources(false)?;
@@ -187,7 +187,7 @@ async fn content(State(s): State<Arc<AppState>>, Query(p): Query<ContentParams>)
         index: 0, title: p.title.unwrap_or_default(), url: p.url.clone(),
         is_volume: false, is_vip: false,
     };
-    let text = s.books.content(src, &book, &chapter).await?;
+    let text = s.books.content_with_next(src, &book, &chapter, p.next_url.as_deref()).await?;
     Ok(Json(json!({ "content": text })))
 }
 

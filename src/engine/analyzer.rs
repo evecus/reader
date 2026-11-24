@@ -13,7 +13,8 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    Default, // CSS (jsoup)
+    Default, // Legado 默认语法（AnalyzeByJSoup：class./tag./id./children/索引，其余回退 CSS）
+    Css,     // @CSS: 前缀：纯 CSS 选择器 + 末尾 @修饰符
     XPath,
     Json,
     Js,
@@ -172,9 +173,9 @@ fn parse_piece(raw: &str) -> RulePiece {
     if mode != Mode::Js && lower.starts_with("@js:") {
         mode = Mode::Js;
         s = s[4..].to_string();
-    } else if s.len() >= 2 && s[..2].eq_ignore_ascii_case("@c") && lower.starts_with("@css:") {
-        mode = Mode::Default;
-        s = s[5..].to_string();
+    } else if lower.starts_with("@css:") {
+        mode = Mode::Css;
+        s = s[5..].trim().to_string();
     } else if s.starts_with("@@") {
         mode = Mode::Default;
         s = s[2..].to_string();

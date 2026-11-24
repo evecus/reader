@@ -14,6 +14,7 @@ use crate::error::{AppError, AppResult};
 use aes::cipher::block_padding::{NoPadding, Pkcs7, ZeroPadding};
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut};
 use base64::Engine;
+use des::{Des, TdesEde2, TdesEde3};
 use digest::Digest;
 use hmac::{Hmac, Mac};
 use md5::Md5;
@@ -32,6 +33,19 @@ type Aes192CbcEnc = cbc::Encryptor<aes::Aes192>;
 type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+
+type DesEcbEnc = ecb::Encryptor<Des>;
+type DesEcbDec = ecb::Decryptor<Des>;
+type DesCbcEnc = cbc::Encryptor<Des>;
+type DesCbcDec = cbc::Decryptor<Des>;
+type Tdes2EcbEnc = ecb::Encryptor<TdesEde2>;
+type Tdes2EcbDec = ecb::Decryptor<TdesEde2>;
+type Tdes2CbcEnc = cbc::Encryptor<TdesEde2>;
+type Tdes2CbcDec = cbc::Decryptor<TdesEde2>;
+type Tdes3EcbEnc = ecb::Encryptor<TdesEde3>;
+type Tdes3EcbDec = ecb::Decryptor<TdesEde3>;
+type Tdes3CbcEnc = cbc::Encryptor<TdesEde3>;
+type Tdes3CbcDec = cbc::Decryptor<TdesEde3>;
 
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
@@ -120,16 +134,26 @@ fn hmac_impl(data: &str, algorithm: &str, key: &[u8], as_hex: bool) -> AppResult
 
 // ---------------- AES ----------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum AesMode { Ecb, Cbc }
 
 #[derive(Clone, Copy, PartialEq)]
 enum AesPadding { Pkcs7, Zero, None }
 
-/// 解析 transformation："AES/CBC/PKCS5Padding" → (CBC, PKCS7)
+/// 对称密码族：transformation 首段决定（AES / DES / DESede(3DES)）
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SymAlg { Aes, Des, Tdes }
+
+/// 解析 transformation："AES/CBC/PKCS5Padding" → (算法, CBC, PKCS7)
 /// 兼容官方 JCA 写法：PKCS5Padding 在 AES(16字节块) 下等价于 PKCS7Padding
-fn parse_transformation(t: &str) -> (AesMode, AesPadding) {
+fn parse_transformation(t: &str) -> (SymAlg, AesMode, AesPadding) {
     let parts: Vec<&str> = t.split('/').collect();
+    let head = parts.first().map(|s| norm_alg(s)).unwrap_or_default();
+    let alg = match head.as_str() {
+        "des" => SymAlg::Des,
+        "desede" | "3des" | "tripledes" | "tdes" => SymAlg::Tdes,
+        _ => SymAlg::Aes, // 默认 AES（与 JCA "AES" 一致）
+    };
     let mode = if parts.get(1).map(|s| s.eq_ignore_ascii_case("cbc")).unwrap_or(false) {
         AesMode::Cbc
     } else {
@@ -141,11 +165,12 @@ fn parse_transformation(t: &str) -> (AesMode, AesPadding) {
         Some(p) if p.contains("nopadding") || p == "raw" => AesPadding::None,
         _ => AesPadding::Pkcs7,
     };
-    (mode, padding)
+    (alg, mode, padding)
 }
 
-/// AES 加密 → 原始字节。key 长度决定 128/192/256；CBC 需 16 字节 iv。
+/// 通用对称加密 → 原始字节。
 /// key/iv 传入的是原始字符串字节（官方 createSymmetricCrypto 对 String 直接 encodeToByteArray）。
+/// DES：key 8 字节；3DES：key 16 字节（K1K2K1，对齐 Java DESede）/ 24 字节。
 ///
 /// ECB 的 cipher 只实现 KeyInit（`new_from_slice(key)` 单参数）；
 /// CBC 的 cipher 实现 KeyIvInit（`new_from_slices(key, iv)` 双参数）。
@@ -153,14 +178,14 @@ fn parse_transformation(t: &str) -> (AesMode, AesPadding) {
 macro_rules! enc_ecb {
     ($cipher:ty, $pad:ty, $data:expr, $key:expr) => {{
         Ok(<$cipher as aes::cipher::KeyInit>::new_from_slice($key)
-            .map_err(|_| AppError::bad_request("AES 密钥长度须为 16/24/32 字节".to_string()))?
+            .map_err(|_| AppError::bad_request("密钥长度非法".to_string()))?
             .encrypt_padded_vec_mut::<$pad>($data))
     }};
 }
 macro_rules! enc_cbc {
     ($cipher:ty, $pad:ty, $data:expr, $key:expr, $iv:expr) => {{
         Ok(<$cipher as aes::cipher::KeyIvInit>::new_from_slices($key, $iv)
-            .map_err(|_| AppError::bad_request("AES 密钥/IV 长度非法".to_string()))?
+            .map_err(|_| AppError::bad_request("密钥/IV 长度非法".to_string()))?
             .encrypt_padded_vec_mut::<$pad>($data))
     }};
 }
@@ -183,33 +208,42 @@ macro_rules! dispatch_enc_cbc {
     };
 }
 
-fn aes_encrypt_bytes(data: &[u8], key: &[u8], iv: &[u8], t: &str) -> AppResult<Vec<u8>> {
-    let (mode, padding) = parse_transformation(t);
-    match (key.len(), mode) {
-        (16, AesMode::Ecb) => dispatch_enc_ecb!(Aes128EcbEnc, padding, data, key),
-        (16, AesMode::Cbc) => dispatch_enc_cbc!(Aes128CbcEnc, padding, data, key, iv),
-        (24, AesMode::Ecb) => dispatch_enc_ecb!(Aes192EcbEnc, padding, data, key),
-        (24, AesMode::Cbc) => dispatch_enc_cbc!(Aes192CbcEnc, padding, data, key, iv),
-        (32, AesMode::Ecb) => dispatch_enc_ecb!(Aes256EcbEnc, padding, data, key),
-        (32, AesMode::Cbc) => dispatch_enc_cbc!(Aes256CbcEnc, padding, data, key, iv),
-        (n, _) => Err(AppError::bad_request(format!("AES 密钥长度须为 16/24/32 字节，实际 {}", n))),
+fn sym_encrypt_bytes(alg: SymAlg, data: &[u8], key: &[u8], iv: &[u8], t: &str) -> AppResult<Vec<u8>> {
+    let (parsed_alg, mode, padding) = parse_transformation(t);
+    let alg = if parsed_alg != alg { parsed_alg } else { alg };
+    match (alg, key.len(), mode) {
+        (SymAlg::Aes, 16, AesMode::Ecb) => dispatch_enc_ecb!(Aes128EcbEnc, padding, data, key),
+        (SymAlg::Aes, 16, AesMode::Cbc) => dispatch_enc_cbc!(Aes128CbcEnc, padding, data, key, iv),
+        (SymAlg::Aes, 24, AesMode::Ecb) => dispatch_enc_ecb!(Aes192EcbEnc, padding, data, key),
+        (SymAlg::Aes, 24, AesMode::Cbc) => dispatch_enc_cbc!(Aes192CbcEnc, padding, data, key, iv),
+        (SymAlg::Aes, 32, AesMode::Ecb) => dispatch_enc_ecb!(Aes256EcbEnc, padding, data, key),
+        (SymAlg::Aes, 32, AesMode::Cbc) => dispatch_enc_cbc!(Aes256CbcEnc, padding, data, key, iv),
+        (SymAlg::Des, 8, AesMode::Ecb) => dispatch_enc_ecb!(DesEcbEnc, padding, data, key),
+        (SymAlg::Des, 8, AesMode::Cbc) => dispatch_enc_cbc!(DesCbcEnc, padding, data, key, iv),
+        (SymAlg::Tdes, 16, AesMode::Ecb) => dispatch_enc_ecb!(Tdes2EcbEnc, padding, data, key),
+        (SymAlg::Tdes, 16, AesMode::Cbc) => dispatch_enc_cbc!(Tdes2CbcEnc, padding, data, key, iv),
+        (SymAlg::Tdes, 24, AesMode::Ecb) => dispatch_enc_ecb!(Tdes3EcbEnc, padding, data, key),
+        (SymAlg::Tdes, 24, AesMode::Cbc) => dispatch_enc_cbc!(Tdes3CbcEnc, padding, data, key, iv),
+        (SymAlg::Aes, n, _) => Err(AppError::bad_request(format!("AES 密钥长度须为 16/24/32 字节，实际 {}", n))),
+        (SymAlg::Des, n, _) => Err(AppError::bad_request(format!("DES 密钥长度须为 8 字节，实际 {}", n))),
+        (SymAlg::Tdes, n, _) => Err(AppError::bad_request(format!("3DES 密钥长度须为 16/24 字节，实际 {}", n))),
     }
 }
 
 macro_rules! dec_ecb {
     ($cipher:ty, $pad:ty, $data:expr, $key:expr) => {{
         Ok(<$cipher as aes::cipher::KeyInit>::new_from_slice($key)
-            .map_err(|_| AppError::bad_request("AES 密钥长度须为 16/24/32 字节".to_string()))?
+            .map_err(|_| AppError::bad_request("密钥长度非法".to_string()))?
             .decrypt_padded_vec_mut::<$pad>($data)
-            .map_err(|_| AppError::bad_request("AES 解密失败：填充或密钥错误".to_string()))?)
+            .map_err(|_| AppError::bad_request("解密失败：填充或密钥错误".to_string()))?)
     }};
 }
 macro_rules! dec_cbc {
     ($cipher:ty, $pad:ty, $data:expr, $key:expr, $iv:expr) => {{
         Ok(<$cipher as aes::cipher::KeyIvInit>::new_from_slices($key, $iv)
-            .map_err(|_| AppError::bad_request("AES 密钥/IV 长度非法".to_string()))?
+            .map_err(|_| AppError::bad_request("密钥/IV 长度非法".to_string()))?
             .decrypt_padded_vec_mut::<$pad>($data)
-            .map_err(|_| AppError::bad_request("AES 解密失败：填充或密钥错误".to_string()))?)
+            .map_err(|_| AppError::bad_request("解密失败：填充或密钥错误".to_string()))?)
     }};
 }
 macro_rules! dispatch_dec_ecb {
@@ -231,16 +265,25 @@ macro_rules! dispatch_dec_cbc {
     };
 }
 
-fn aes_decrypt_bytes(data: &[u8], key: &[u8], iv: &[u8], t: &str) -> AppResult<Vec<u8>> {
-    let (mode, padding) = parse_transformation(t);
-    match (key.len(), mode) {
-        (16, AesMode::Ecb) => dispatch_dec_ecb!(Aes128EcbDec, padding, data, key),
-        (16, AesMode::Cbc) => dispatch_dec_cbc!(Aes128CbcDec, padding, data, key, iv),
-        (24, AesMode::Ecb) => dispatch_dec_ecb!(Aes192EcbDec, padding, data, key),
-        (24, AesMode::Cbc) => dispatch_dec_cbc!(Aes192CbcDec, padding, data, key, iv),
-        (32, AesMode::Ecb) => dispatch_dec_ecb!(Aes256EcbDec, padding, data, key),
-        (32, AesMode::Cbc) => dispatch_dec_cbc!(Aes256CbcDec, padding, data, key, iv),
-        (n, _) => Err(AppError::bad_request(format!("AES 密钥长度须为 16/24/32 字节，实际 {}", n))),
+fn sym_decrypt_bytes(alg: SymAlg, data: &[u8], key: &[u8], iv: &[u8], t: &str) -> AppResult<Vec<u8>> {
+    let (parsed_alg, mode, padding) = parse_transformation(t);
+    let alg = if parsed_alg != alg { parsed_alg } else { alg };
+    match (alg, key.len(), mode) {
+        (SymAlg::Aes, 16, AesMode::Ecb) => dispatch_dec_ecb!(Aes128EcbDec, padding, data, key),
+        (SymAlg::Aes, 16, AesMode::Cbc) => dispatch_dec_cbc!(Aes128CbcDec, padding, data, key, iv),
+        (SymAlg::Aes, 24, AesMode::Ecb) => dispatch_dec_ecb!(Aes192EcbDec, padding, data, key),
+        (SymAlg::Aes, 24, AesMode::Cbc) => dispatch_dec_cbc!(Aes192CbcDec, padding, data, key, iv),
+        (SymAlg::Aes, 32, AesMode::Ecb) => dispatch_dec_ecb!(Aes256EcbDec, padding, data, key),
+        (SymAlg::Aes, 32, AesMode::Cbc) => dispatch_dec_cbc!(Aes256CbcDec, padding, data, key, iv),
+        (SymAlg::Des, 8, AesMode::Ecb) => dispatch_dec_ecb!(DesEcbDec, padding, data, key),
+        (SymAlg::Des, 8, AesMode::Cbc) => dispatch_dec_cbc!(DesCbcDec, padding, data, key, iv),
+        (SymAlg::Tdes, 16, AesMode::Ecb) => dispatch_dec_ecb!(Tdes2EcbDec, padding, data, key),
+        (SymAlg::Tdes, 16, AesMode::Cbc) => dispatch_dec_cbc!(Tdes2CbcDec, padding, data, key, iv),
+        (SymAlg::Tdes, 24, AesMode::Ecb) => dispatch_dec_ecb!(Tdes3EcbDec, padding, data, key),
+        (SymAlg::Tdes, 24, AesMode::Cbc) => dispatch_dec_cbc!(Tdes3CbcDec, padding, data, key, iv),
+        (SymAlg::Aes, n, _) => Err(AppError::bad_request(format!("AES 密钥长度须为 16/24/32 字节，实际 {}", n))),
+        (SymAlg::Des, n, _) => Err(AppError::bad_request(format!("DES 密钥长度须为 8 字节，实际 {}", n))),
+        (SymAlg::Tdes, n, _) => Err(AppError::bad_request(format!("3DES 密钥长度须为 16/24 字节，实际 {}", n))),
     }
 }
 
@@ -255,7 +298,7 @@ fn decode_key(s: &str, is_base64: bool) -> AppResult<Vec<u8>> {
 pub fn aes_encrypt_base64(data: &str, key: &str, transformation: &str, iv: &str, key_iv_b64: bool) -> AppResult<String> {
     let k = decode_key(key, key_iv_b64)?;
     let i = decode_key(iv, key_iv_b64)?;
-    let out = aes_encrypt_bytes(data.as_bytes(), &k, &i, transformation)?;
+    let out = sym_encrypt_bytes(SymAlg::Aes, data.as_bytes(), &k, &i, transformation)?;
     Ok(b64().encode(out))
 }
 
@@ -263,7 +306,7 @@ pub fn aes_encrypt_base64(data: &str, key: &str, transformation: &str, iv: &str,
 pub fn aes_encrypt_hex(data: &str, key: &str, transformation: &str, iv: &str, key_iv_b64: bool) -> AppResult<String> {
     let k = decode_key(key, key_iv_b64)?;
     let i = decode_key(iv, key_iv_b64)?;
-    let out = aes_encrypt_bytes(data.as_bytes(), &k, &i, transformation)?;
+    let out = sym_encrypt_bytes(SymAlg::Aes, data.as_bytes(), &k, &i, transformation)?;
     Ok(hex::encode(out))
 }
 
@@ -272,7 +315,7 @@ pub fn aes_decrypt_base64_to_string(data: &str, key: &str, transformation: &str,
     let k = decode_key(key, key_iv_b64)?;
     let i = decode_key(iv, key_iv_b64)?;
     let bytes = b64().decode(data).map_err(|e| AppError::bad_request(format!("密文 Base64 解码失败: {}", e)))?;
-    let out = aes_decrypt_bytes(&bytes, &k, &i, transformation)?;
+    let out = sym_decrypt_bytes(SymAlg::Aes, &bytes, &k, &i, transformation)?;
     Ok(String::from_utf8_lossy(&out).to_string())
 }
 
@@ -281,7 +324,100 @@ pub fn aes_decrypt_hex_to_string(data: &str, key: &str, transformation: &str, iv
     let k = decode_key(key, key_iv_b64)?;
     let i = decode_key(iv, key_iv_b64)?;
     let bytes = hex::decode(data).map_err(|e| AppError::bad_request(format!("密文 hex 解码失败: {}", e)))?;
-    let out = aes_decrypt_bytes(&bytes, &k, &i, transformation)?;
+    let out = sym_decrypt_bytes(SymAlg::Aes, &bytes, &k, &i, transformation)?;
+    Ok(String::from_utf8_lossy(&out).to_string())
+}
+
+// ---------------- 通用对称加密（createSymmetricCrypto / DES / 3DES） ----------------
+
+/// 官方 isHex 判定：非空、长度为偶数、全部为 hex 字符（用于 decrypt(String) 自动识别）
+fn is_hex(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() % 2 == 0
+        && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// createSymmetricCrypto(...).encryptBase64(data)
+pub fn sym_encrypt_base64(data: &str, key: &str, transformation: &str, iv: &str) -> AppResult<String> {
+    let out = sym_encrypt_bytes(SymAlg::Aes, data.as_bytes(), key.as_bytes(), iv.as_bytes(), transformation)?;
+    Ok(b64().encode(out))
+}
+
+/// createSymmetricCrypto(...).encryptHex(data)
+pub fn sym_encrypt_hex(data: &str, key: &str, transformation: &str, iv: &str) -> AppResult<String> {
+    let out = sym_encrypt_bytes(SymAlg::Aes, data.as_bytes(), key.as_bytes(), iv.as_bytes(), transformation)?;
+    Ok(hex::encode(out))
+}
+
+/// createSymmetricCrypto(...).encrypt(data) 的 String 化（官方 desEncodeToString 直接 String(bytes)）
+pub fn sym_encrypt_raw_string(data: &str, key: &str, transformation: &str, iv: &str) -> AppResult<String> {
+    let out = sym_encrypt_bytes(SymAlg::Aes, data.as_bytes(), key.as_bytes(), iv.as_bytes(), transformation)?;
+    Ok(String::from_utf8_lossy(&out).to_string())
+}
+
+/// createSymmetricCrypto(...).decrypt(str)：密文自动识别 hex / Base64（对齐 SymmetricCryptoAndroid）
+pub fn sym_decrypt_auto(data: &str, key: &str, transformation: &str, iv: &str) -> AppResult<Vec<u8>> {
+    let bytes = if is_hex(data) {
+        hex::decode(data).map_err(|e| AppError::bad_request(format!("密文 hex 解码失败: {}", e)))?
+    } else {
+        b64().decode(data).map_err(|e| AppError::bad_request(format!("密文 Base64 解码失败: {}", e)))?
+    };
+    sym_decrypt_bytes(SymAlg::Aes, &bytes, key.as_bytes(), iv.as_bytes(), transformation)
+}
+
+/// createSymmetricCrypto(...).decryptStr(str) → UTF-8 字符串
+pub fn sym_decrypt_str(data: &str, key: &str, transformation: &str, iv: &str) -> AppResult<String> {
+    let out = sym_decrypt_auto(data, key, transformation, iv)?;
+    Ok(String::from_utf8_lossy(&out).to_string())
+}
+
+// ---------------- 官方遗留的 des*/tripleDES* 函数（底层同为 SymmetricCrypto） ----------------
+
+/// desEncodeToString(data, key, transformation, iv)：String(encrypt(data))
+pub fn des_encode_to_string(data: &str, key: &str, transformation: &str, iv: &str) -> AppResult<String> {
+    sym_encrypt_raw_string(data, key, transformation, iv)
+}
+
+/// desEncodeToBase64String(data, key, transformation, iv)
+pub fn des_encode_to_base64_string(data: &str, key: &str, transformation: &str, iv: &str) -> AppResult<String> {
+    sym_encrypt_base64(data, key, transformation, iv)
+}
+
+/// desDecodeToString / desBase64DecodeToString(data, key, transformation, iv)：密文自动识别 hex/Base64
+pub fn des_decode_to_string(data: &str, key: &str, transformation: &str, iv: &str) -> AppResult<String> {
+    sym_decrypt_str(data, key, transformation, iv)
+}
+
+/// tripleDESEncodeBase64Str(data, key, mode, padding, iv)：transformation = DESede/mode/padding
+pub fn tripledes_encode_base64(data: &str, key: &str, mode: &str, padding: &str, iv: &str) -> AppResult<String> {
+    let t = format!("DESede/{}/{}", mode, padding);
+    sym_encrypt_base64(data, key, &t, iv)
+}
+
+/// tripleDESDecodeStr(data, key, mode, padding, iv)
+pub fn tripledes_decode_str(data: &str, key: &str, mode: &str, padding: &str, iv: &str) -> AppResult<String> {
+    let t = format!("DESede/{}/{}", mode, padding);
+    sym_decrypt_str(data, key, &t, iv)
+}
+
+/// tripleDESEncodeArgsBase64Str / tripleDESDecodeArgsBase64Str 的参数预处理：
+/// key 为 Base64 编码，iv 为原始字符串字节（对齐官方）
+pub fn tripledes_encode_args_base64(data: &str, key_b64: &str, mode: &str, padding: &str, iv: &str) -> AppResult<String> {
+    let t = format!("DESede/{}/{}", mode, padding);
+    let k = decode_key(key_b64, true)?;
+    let out = sym_encrypt_bytes(SymAlg::Tdes, data.as_bytes(), &k, iv.as_bytes(), &t)?;
+    Ok(b64().encode(out))
+}
+
+pub fn tripledes_decode_args_base64(data: &str, key_b64: &str, mode: &str, padding: &str, iv: &str) -> AppResult<String> {
+    let t = format!("DESede/{}/{}", mode, padding);
+    let k = decode_key(key_b64, true)?;
+    let bytes = if is_hex(data) {
+        hex::decode(data).map_err(|e| AppError::bad_request(format!("密文 hex 解码失败: {}", e)))?
+    } else {
+        b64().decode(data).map_err(|e| AppError::bad_request(format!("密文 Base64 解码失败: {}", e)))?
+    };
+    let out = sym_decrypt_bytes(SymAlg::Tdes, &bytes, &k, iv.as_bytes(), &t)?;
     Ok(String::from_utf8_lossy(&out).to_string())
 }
 
@@ -338,7 +474,60 @@ mod tests {
         let key = hex::decode("2b7e151628aed2a6abf7158809cf4f3c").unwrap();
         let iv = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
         let pt = hex::decode("6bc1bee22e409f96e93d7e117393172a").unwrap();
-        let ct = aes_encrypt_bytes(&pt, &key, &iv, "AES/CBC/NoPadding").unwrap();
+        let ct = sym_encrypt_bytes(SymAlg::Aes, &pt, &key, &iv, "AES/CBC/NoPadding").unwrap();
         assert_eq!(hex::encode(ct), "7649abac8119b246cee98e9b12e9197d");
+    }
+
+    #[test]
+    fn des_ecb_pkcs5_roundtrip() {
+        // DES 8 字节密钥
+        let ct = sym_encrypt_base64("hello", "12345678", "DES/ECB/PKCS5Padding", "").unwrap();
+        assert_eq!(sym_decrypt_str(&ct, "12345678", "DES/ECB/PKCS5Padding", "").unwrap(), "hello");
+    }
+
+    #[test]
+    fn des_cbc_pkcs5_roundtrip() {
+        let ct = sym_encrypt_hex("数据", "12345678", "DES/CBC/PKCS5Padding", "87654321").unwrap();
+        assert_eq!(sym_decrypt_str(&ct, "12345678", "DES/CBC/PKCS5Padding", "87654321").unwrap(), "数据");
+    }
+
+    #[test]
+    fn tdes_16byte_key_matches_java_k1k2k1() {
+        // Java DESede 16 字节密钥 = K1 K2 K1（EDE2），等价于 24 字节 K1K2K1（EDE3）
+        let k16 = "1234567890abcdef";
+        let k24 = format!("{}{}", k16, &k16[..8]);
+        let c16 = sym_encrypt_base64("test-3des", k16, "DESede/ECB/PKCS5Padding", "").unwrap();
+        let c24 = sym_encrypt_base64("test-3des", &k24, "DESede/ECB/PKCS5Padding", "").unwrap();
+        assert_eq!(c16, c24);
+        assert_eq!(sym_decrypt_str(&c24, &k24, "DESede/ECB/PKCS5Padding", "").unwrap(), "test-3des");
+    }
+
+    #[test]
+    fn sym_decrypt_auto_hex_and_base64() {
+        // 同一密文的 hex / Base64 两种输入都应可解（对齐 SymmetricCryptoAndroid.decrypt(String)）
+        let key = "1234567890abcdef";
+        let ct = sym_encrypt_hex("auto-detect", key, "AES/ECB/PKCS5Padding", "").unwrap();
+        let ct_b64 = b64().encode(hex::decode(&ct).unwrap());
+        assert_eq!(sym_decrypt_str(&ct, key, "AES/ECB/PKCS5Padding", "").unwrap(), "auto-detect");
+        assert_eq!(sym_decrypt_str(&ct_b64, key, "AES/ECB/PKCS5Padding", "").unwrap(), "auto-detect");
+        // isHex 语义：奇数长度 / 非 hex 字符 → 走 Base64
+        assert!(!is_hex("abc"), "奇数长度不是 hex");
+        assert!(is_hex("ABCDEF01"), "偶数长度 hex 合法");
+    }
+
+    #[test]
+    fn tripledes_legacy_fns() {
+        let c = tripledes_encode_base64("legacy", "1234567890abcdef12345678", "ECB", "PKCS5Padding", "").unwrap();
+        assert_eq!(tripledes_decode_str(&c, "1234567890abcdef12345678", "ECB", "PKCS5Padding", "").unwrap(), "legacy");
+        // ArgsBase64 变体：key 为 Base64
+        let key_b64 = b64().encode(b"1234567890abcdef12345678");
+        let c2 = tripledes_encode_args_base64("legacy-args", &key_b64, "ECB", "PKCS5Padding", "").unwrap();
+        assert_eq!(tripledes_decode_args_base64(&c2, &key_b64, "ECB", "PKCS5Padding", "").unwrap(), "legacy-args");
+    }
+
+    #[test]
+    fn des_wrong_key_len_rejected() {
+        assert!(sym_encrypt_base64("x", "short", "DES/ECB/PKCS5Padding", "").is_err());
+        assert!(sym_encrypt_base64("x", "1234567890abcdef", "DES/ECB/PKCS5Padding", "").is_err());
     }
 }

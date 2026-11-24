@@ -19,7 +19,9 @@
 
 | 语法 | 支持 |
 |---|---|
-| CSS 选择器 + `@text/@html/@href/@src` 修饰符 | ✅ |
+| Legado 默认语法：`class.x@tag.a.0@text`、`id.`、`tag.`、`text.`、`children`、`!` 排除、`[1,-1,2:5]` 索引/区间/反向，其余回退 CSS 选择器 | ✅ 移植自官方 `AnalyzeByJSoup` |
+| `@CSS:` 前缀：纯 CSS 选择器 + 末尾 `@text/@html/@href/@src` 等修饰符 | ✅ |
+| 目录 `nextTocUrl` / 正文 `nextContentUrl` 翻页 | ✅ 单个下一页顺序翻、多个并发抓；URL 去重防循环；正文遇到下一章 URL 即停 |
 | XPath 1.0（`@XPath:` / `/` / `//` 开头） | ✅ 完整（sxd-xpath，支持轴/谓词/函数/位置） |
 | `@Json:` / `$.` / `$[` / `$` 根 | ✅ |
 | `@js:` / `<js>` / `{{...}}`（jsLib） | ✅ QuickJS |
@@ -30,7 +32,7 @@
 | `##` 正则替换 | ✅ |
 | `&&` 并集 / `\|\|` 择一 / `%%` 交织 组合符 | ✅（按官方 `AnalyzeByJSoup` 语义） |
 | `a@text` 等多步 CSS 链修饰规则 | ✅ |
-| 目录 `-` 前缀（书源已正序不反转） | ✅ |
+| 目录 `-` 前缀（站点目录是倒序，需反转；无前缀保持页面顺序） | ✅ 并按章节 URL 去重 |
 | `@get:{}` / `@put:{}` 变量 | ✅ |
 | `java.put/get` + `source.getVariable/setVariable` 变量持久化（SQLite） | ✅ 跨请求保留登录态 |
 | Cookie jar（域级隔离、Set-Cookie 自动回写、Cookie 请求头注入、`java.getCookie`） | ✅ 进程级共享 |
@@ -39,7 +41,7 @@
 | `java.aesEncode/aesDecode`（ECB/CBC，PKCS5/7/NoPadding，128/192/256） | ✅ + ArgsBase64 变体 |
 | 响应编码：显式 charset / meta charset 探测（GBK/GB18030/Big5 等） | ✅ |
 
-> 说明：依赖 Legado 私有运行机制（如 `java.startBrowser()`、VIP 渲染面板、WebView 动态渲染、字体反混淆等）的聚合/插件型书源，可能仅搜索/详情/目录可用，正文无法完整复现。变量与 Cookie 已跨请求持久化，登录型书源多数场景可读正文；内置 CryptoJS 与 java.* 加密绑定覆盖了签名型书源（无需书源自带 jsLib）。仍缺的集中在 `@webjs:`/WebView 渲染、字体反混淆、目录/正文分页（`nextTocUrl`/`nextContentUrl`）、DES/非对称加密等。
+> 说明：依赖 Legado 私有运行机制（如 `java.startBrowser()`、VIP 渲染面板、WebView 动态渲染、字体反混淆等）的聚合/插件型书源，可能仅搜索/详情/目录可用，正文无法完整复现。变量与 Cookie 已跨请求持久化，登录型书源多数场景可读正文；内置 CryptoJS 与 java.* 加密绑定覆盖了签名型书源（无需书源自带 jsLib）。仍缺的集中在 `@webjs:`/WebView 渲染、字体反混淆、DES/非对称加密等。
 
 ## 运行
 

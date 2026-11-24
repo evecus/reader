@@ -8,6 +8,9 @@ mod error;
 mod fetcher;
 mod model;
 mod state;
+mod webview;
+
+use crate::engine::js as js_engine;
 
 use axum::{
     http::{header, HeaderValue, StatusCode},
@@ -15,7 +18,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use rust_embed::RustEmbed;
+use rust_embed::{Embed, RustEmbed};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +39,9 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./data"));
     let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(5888);
+
+    // JS 文件 API（downloadFile/cacheFile/readTxtFile）的基础目录
+    js_engine::set_file_base_dir(data_dir.join("cache"));
 
     let state = match state::AppState::new(data_dir) {
         Ok(s) => Arc::new(s),
