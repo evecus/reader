@@ -9,8 +9,8 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/target/release/legado-server /usr/local/bin/legado-server
+COPY --from=builder /build/target/release/reader /usr/local/bin/reader
 ENV DATA_DIR=/data PORT=5888
 VOLUME /data
 EXPOSE 5888
-ENTRYPOINT ["legado-server"]
+ENTRYPOINT ["reader"]

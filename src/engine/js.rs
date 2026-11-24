@@ -64,10 +64,10 @@ fn eval_inner(expr: &str, ctx: &JsContext, script_mode: bool) -> AppResult<Strin
         let script = if script_mode {
             // jsUrl 多语句脚本：eval 返回最后一条表达式的值
             let expr_json = serde_json::to_string(expr).unwrap_or_else(|_| "\"\"".into());
-            format!("{}\n;var __legado_result = eval({});\n__legado_result;", ctx.js_lib, expr_json)
+            format!("{}\n;var __reader_result = eval({});\n__reader_result;", ctx.js_lib, expr_json)
         } else {
             // 规则表达式：IIFE 包装
-            format!("{}\n;var __legado_result = (function(){{ return ({}); }})();\n__legado_result;", ctx.js_lib, expr)
+            format!("{}\n;var __reader_result = (function(){{ return ({}); }})();\n__reader_result;", ctx.js_lib, expr)
         };
         let val: Value = js.eval(script).map_err(|e| {
             let detail = catch_js_error(&js);
@@ -178,9 +178,9 @@ fn inject_bindings(js: &rquickjs::Ctx<'_>, jc: &JsContext) -> AppResult<()> {
     // 初始化变量对象 + 注入已保存变量（通过 JS bootstrap，避免闭包捕获 Ctx）
     let vars_init = serde_json::to_string(&jc.variables).unwrap_or_else(|_| "{}".to_string());
     let bootstrap = format!(
-        "var __LEGADO_VARS = {}; \
+        "var __READER_VARS = {}; \
          if (!globalThis.java) globalThis.java = {{}}; \
-         java.put = function(k, v) {{ __LEGADO_VARS[k] = v; return v; }}; \
+         java.put = function(k, v) {{ __READER_VARS[k] = v; return v; }}; \
          java.getString = function(x) {{ return x == null ? '' : String(x); }};",
         vars_init
     );

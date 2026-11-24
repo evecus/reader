@@ -1,6 +1,6 @@
-# legado-server
+# reader
 
-服务端版 Legado：Rust 实现的 Legado 书源解析引擎 + 内嵌 Web 前端，单二进制、本地单用户。
+服务端版阅读器：Rust 实现的 Legado 书源解析引擎 + 内嵌 Web 前端，单二进制、本地单用户。
 
 以 [gedoor/legado](https://github.com/gedoor/legado) 的规则引擎为核心参考，直接消费 Legado 书源 JSON（无需改写为插件）。
 
@@ -39,7 +39,7 @@ cd web && npm install && npm run build && cd ..
 cargo build --release
 
 # 运行
-DATA_DIR=./data PORT=5888 ./target/release/legado-server
+DATA_DIR=./data PORT=5888 ./target/release/reader
 ```
 
 打开 `http://localhost:5888`。
@@ -47,8 +47,8 @@ DATA_DIR=./data PORT=5888 ./target/release/legado-server
 Docker：
 
 ```bash
-docker build -t legado-server .
-docker run -d -p 5888:5888 -v ./data:/data legado-server
+docker build -t reader .
+docker run -d -p 5888:5888 -v ./data:/data reader
 ```
 
 ## API

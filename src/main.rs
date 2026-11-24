@@ -28,7 +28,7 @@ struct Assets;
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive("legado_server=info".parse().unwrap()))
+            .add_directive("reader=info".parse().unwrap()))
         .init();
 
     let data_dir = std::env::var("DATA_DIR")
@@ -50,13 +50,13 @@ async fn main() {
         .layer(cors);
 
     let addr = format!("0.0.0.0:{port}");
-    println!("legado-server 已启动: http://{addr}");
+    println!("reader 已启动: http://{addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("绑定端口失败");
     axum::serve(listener, app).await.expect("服务异常");
 }
 
 async fn health() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok", "name": "legado-server", "version": "0.1.0" }))
+    Json(json!({ "status": "ok", "name": "reader", "version": "0.1.0" }))
 }
 
 async fn static_handler(uri: axum::extract::OriginalUri) -> Response {

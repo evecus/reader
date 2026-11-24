@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
-import { useToast } from '../App'
-import { IconBack, IconBook, IconDownload } from '../icons'
+import { useToast, PageHeader } from '../App'
+import { IconBook, IconDownload } from '../icons'
 import type { Book } from '../types'
 
 export default function BookInfoPage() {
@@ -45,7 +45,7 @@ export default function BookInfoPage() {
         name: book.name,
         author: book.author,
       })
-      toast('已开始后台下载，可在「缓存」页查看进度')
+      toast('已开始后台下载，可在「离线缓存」页查看进度')
       navigate('/cache')
     } catch (e) { toast((e as Error).message); setDownloading(false) }
   }
@@ -72,40 +72,37 @@ export default function BookInfoPage() {
 
   return (
     <>
-      <header className="appbar">
-        <button className="icon-btn" onClick={() => navigate(-1)}><IconBack /></button>
-        <div className="title">书籍信息</div>
-      </header>
-      <main className="page">
-        {loading && <div className="loading"><div className="spinner" />加载详情…</div>}
-        <div className="detail-header">
-          <div style={{ display: 'flex', gap: 16 }}>
-            <div className="book-cover" style={{ width: 96, height: 132, fontSize: 16 }}>{cover}</div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div className="detail-title">{book.name}</div>
-              <div className="detail-meta"><span>{book.author || '未知作者'}</span><span>{book.kind}</span></div>
-              <div className="detail-meta"><span>{book.wordCount}</span></div>
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                最新：{book.lastChapter || '暂无'}
-              </div>
-              <div style={{ fontSize: 12, color: 'var(--primary)', marginTop: 4 }}>来源：{book.originName}</div>
-            </div>
+      <PageHeader title="书籍详情" backTo={-1}
+        subtitle={loading ? '正在加载详情…' : '书籍信息与阅读操作'} />
+      {loading && <div className="loading"><div className="spinner" />加载详情…</div>}
+      <div className="detail-layout">
+        <div className="detail-cover">{cover}</div>
+        <div className="detail-main">
+          <h2>{book.name}</h2>
+          <div className="detail-meta">
+            <span>作者 <b>{book.author || '未知'}</b></span>
+            <span>分类 <b>{book.kind || '—'}</b></span>
+            <span>字数 <b>{book.wordCount || '—'}</b></span>
           </div>
+          <div className="detail-meta">
+            <span>最新章节 <b>{book.lastChapter || '暂无'}</b></span>
+          </div>
+          <div className="detail-origin">来源：{book.originName || origin}</div>
           <div className="detail-actions">
-            <button className={`btn ${inShelf ? 'btn-ghost' : 'btn-outline'}`} onClick={toggleShelf}>
-              {inShelf ? '已在书架' : '加入书架'}
+            <button className={`btn ${inShelf ? 'btn-soft' : 'btn-outline'}`} onClick={toggleShelf}>
+              {inShelf ? '✓ 已在书架' : '+ 加入书架'}
             </button>
-            <button className="btn btn-outline" onClick={downloadAll} disabled={downloading}>
-              <IconDownload style={{ width: 16, height: 16 }} /> {downloading ? '下载中' : '下载全书'}
+            <button className="btn btn-ghost" onClick={downloadAll} disabled={downloading}>
+              <IconDownload /> {downloading ? '下载中' : '下载全书'}
             </button>
             <button className="btn btn-primary" onClick={goChapters}><IconBook /> 开始阅读</button>
           </div>
         </div>
-        <div className="detail-intro">
-          <h3>简介</h3>
-          <p>{book.intro || '暂无简介'}</p>
-        </div>
-      </main>
+      </div>
+      <div className="detail-intro">
+        <h3>内容简介</h3>
+        <p>{book.intro || '暂无简介'}</p>
+      </div>
     </>
   )
 }

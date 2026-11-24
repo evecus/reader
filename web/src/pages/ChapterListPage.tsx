@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
-import { useToast } from '../App'
-import { IconBack, IconDownload, IconList } from '../icons'
+import { useToast, PageHeader } from '../App'
+import { IconDownload, IconList } from '../icons'
 import type { BookChapter } from '../types'
 
 export default function ChapterListPage() {
@@ -59,25 +59,30 @@ export default function ChapterListPage() {
 
   return (
     <>
-      <header className="appbar">
-        <button className="icon-btn" onClick={() => navigate(-1)}><IconBack /></button>
-        <div className="title">{name || '目录'} <span style={{ fontSize: 13, opacity: .8 }}>({chapters.length})</span></div>
-        <button className="icon-btn" onClick={() => setReverse(r => !r)} title="倒序"><IconList /></button>
-        <button className="icon-btn" onClick={cacheAll} title="缓存全部"><IconDownload /></button>
-      </header>
-      <main className="page no-pad" style={{ padding: '0 12px 12px' }}>
-        {loading ? <div className="loading"><div className="spinner" />加载目录…</div>
-          : chapters.length === 0 ? <div className="empty"><div>目录为空</div></div>
-          : <div className="chapter-list" style={{ marginTop: 12 }}>
+      <PageHeader
+        title={name || '目录'}
+        subtitle={loading ? '正在加载目录…' : `共 ${chapters.length} 章`}
+        backTo={-1}
+        actions={<>
+          <button className={`btn ${reverse ? 'btn-soft' : 'btn-ghost'}`} onClick={() => setReverse(r => !r)}>
+            <IconList /> {reverse ? '正序' : '倒序'}
+          </button>
+          <button className="btn btn-outline" onClick={cacheAll} disabled={loading || chapters.length === 0}>
+            <IconDownload /> 缓存全部
+          </button>
+        </>}
+      />
+      {loading ? <div className="loading"><div className="spinner" />加载目录…</div>
+        : chapters.length === 0 ? <div className="empty"><div className="empty-title">目录为空</div></div>
+          : <div className="chapter-grid">
               {displayChapters.map((c, i) => (
                 <div key={c.url + i} className={`chapter-item ${fromShelf && i === startChapter ? 'current' : ''}`}
-                  onClick={() => openReader(reverse ? chapters.length - 1 - i : i)}>
-                  <span>{c.title}</span>
+                  onClick={() => openReader(reverse ? chapters.length - 1 - i : i)} title={c.title}>
+                  <span className="ct-title">{c.title}</span>
                   {c.isVip && <span className="vip">VIP</span>}
                 </div>
               ))}
             </div>}
-      </main>
     </>
   )
 }

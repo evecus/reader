@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
-import { useToast } from '../App'
-import { IconBack, IconCheck, IconClose, IconLink, IconPlus, IconTrash, IconUpload } from '../icons'
+import { useToast, PageHeader } from '../App'
+import { IconCheck, IconClose, IconLink, IconPlus, IconTrash, IconUpload } from '../icons'
 import type { BookSource } from '../types'
 
 type ImportTab = 'file' | 'url'
@@ -91,40 +91,39 @@ export default function SourcesPage() {
 
   return (
     <>
-      <header className="appbar">
-        <button className="icon-btn" onClick={() => navigate('/shelf')}><IconBack /></button>
-        <div className="title">书源管理</div>
-        <button className="icon-btn" onClick={() => setShowImport(true)} title="导入"><IconPlus /></button>
-      </header>
-      <main className="page">
-        <div className="list-section-title">共 {sources.length} 个书源，已启用 {enabledCount} 个</div>
-        {loading ? <div className="loading"><div className="spinner" />加载中…</div>
-          : sources.length === 0 ? (
-            <div className="empty">
-              <div>还没有书源</div>
-              <p style={{ fontSize: 13, marginTop: 8 }}>可导入本地书源 JSON 文件，或远程订阅链接</p>
-              <button className="btn btn-primary" style={{ marginTop: 16 }} onClick={() => setShowImport(true)}>
-                <IconPlus /> 导入书源
-              </button>
-            </div>
-          ) : sources.map(s => (
-            <div className="source-card" key={s.bookSourceUrl}>
-              <div className="row">
-                <span className="name">{s.bookSourceName}</span>
-                {s.bookSourceGroup && <span className="group">{s.bookSourceGroup}</span>}
-                <div className={`switch ${s.enabled ? 'on' : ''}`} onClick={() => toggle(s)} />
+      <PageHeader
+        title="书源管理"
+        subtitle={loading ? '正在加载书源…' : `共 ${sources.length} 个书源，已启用 ${enabledCount} 个`}
+        actions={<button className="btn btn-primary" onClick={() => setShowImport(true)}><IconPlus /> 导入书源</button>}
+      />
+      {loading ? <div className="loading"><div className="spinner" />加载中…</div>
+        : sources.length === 0 ? (
+          <div className="empty">
+            <div className="empty-title">还没有书源</div>
+            <p>可导入本地书源 JSON 文件，或远程订阅链接</p>
+            <button className="btn btn-primary" onClick={() => setShowImport(true)}><IconPlus /> 导入书源</button>
+          </div>
+        ) : (
+          <div className="source-grid">
+            {sources.map(s => (
+              <div className="source-card" key={s.bookSourceUrl}>
+                <div className="row">
+                  <span className="name" title={s.bookSourceName}>{s.bookSourceName}</span>
+                  {s.bookSourceGroup && <span className="group">{s.bookSourceGroup}</span>}
+                  <div className={`switch ${s.enabled ? 'on' : ''}`} onClick={() => toggle(s)} title={s.enabled ? '已启用' : '已停用'} />
+                </div>
+                <div className="url" title={s.bookSourceUrl}>{s.bookSourceUrl}</div>
+                <div className="source-actions">
+                  <button className="btn btn-ghost" onClick={() => test(s)} disabled={testing === s.bookSourceUrl}>
+                    {testing === s.bookSourceUrl ? '测试中…' : '测试'}
+                  </button>
+                  <button className="btn btn-ghost" onClick={() => navigate(`/explore?origin=${encodeURIComponent(s.bookSourceUrl)}`)}>发现</button>
+                  <button className="btn btn-ghost" onClick={() => remove(s)}><IconTrash /> 删除</button>
+                </div>
               </div>
-              <div className="url">{s.bookSourceUrl}</div>
-              <div className="source-actions">
-                <button className="btn btn-ghost" onClick={() => test(s)} disabled={testing === s.bookSourceUrl}>
-                  {testing === s.bookSourceUrl ? '测试中…' : '测试'}
-                </button>
-                <button className="btn btn-ghost" onClick={() => navigate(`/explore?origin=${encodeURIComponent(s.bookSourceUrl)}`)}>发现</button>
-                <button className="btn btn-ghost" onClick={() => remove(s)}><IconTrash /> 删除</button>
-              </div>
-            </div>
-          ))}
-      </main>
+            ))}
+          </div>
+        )}
 
       {showImport && (
         <div className="dialog-mask" onClick={closeImport}>

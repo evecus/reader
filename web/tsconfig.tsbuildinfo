@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/api.ts","./src/icons.tsx","./src/main.tsx","./src/types.ts","./src/pages/BookInfoPage.tsx","./src/pages/BookRow.tsx","./src/pages/CachePage.tsx","./src/pages/ChapterListPage.tsx","./src/pages/ReaderPage.tsx","./src/pages/ResultPage.tsx","./src/pages/SearchPage.tsx","./src/pages/ShelfPage.tsx","./src/pages/SourcesPage.tsx"],"version":"5.9.3"}

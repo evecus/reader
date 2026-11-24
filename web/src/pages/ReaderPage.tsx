@@ -32,8 +32,8 @@ export default function ReaderPage() {
   const [loading, setLoading] = useState(true)
   const [showToolbar, setShowToolbar] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
-  const [fontSize, setFontSize] = useState(() => Number(localStorage.getItem('legado_font') || 19))
-  const [themeIdx, setThemeIdx] = useState(() => Number(localStorage.getItem('legado_theme') || 0))
+  const [fontSize, setFontSize] = useState(() => Number(localStorage.getItem('reader_font') || 19))
+  const [themeIdx, setThemeIdx] = useState(() => Number(localStorage.getItem('reader_theme') || 0))
   const scrollRef = useRef<HTMLDivElement>(null)
 
   const chapter = chapters[index]
@@ -41,14 +41,6 @@ export default function ReaderPage() {
   const load = useCallback(async () => {
     if (!chapter) { setLoading(false); return }
     setLoading(true)
-    // 先查缓存
-    try {
-      const cached = await api.listCache()
-      const hit = cached.find(c => c.chapterUrl === chapter.url)
-      if (hit) {
-        // 缓存列表不含正文，需重新请求；这里直接走网络
-      }
-    } catch { /* ignore */ }
     api.content(origin, chapter.url, bookUrl, chapter.title)
       .then(r => { setContent(r.content); scrollRef.current?.scrollTo(0, 0) })
       .catch(e => toast(e.message))
@@ -76,9 +68,9 @@ export default function ReaderPage() {
   const theme = READER_THEMES[themeIdx] || READER_THEMES[0]
   const changeFontSize = (delta: number) => {
     const next = Math.max(14, Math.min(32, fontSize + delta))
-    setFontSize(next); localStorage.setItem('legado_font', String(next))
+    setFontSize(next); localStorage.setItem('reader_font', String(next))
   }
-  const changeTheme = (i: number) => { setThemeIdx(i); localStorage.setItem('legado_theme', String(i)) }
+  const changeTheme = (i: number) => { setThemeIdx(i); localStorage.setItem('reader_theme', String(i)) }
 
   // 正文可能是 <p>段落</p> HTML，也可能是纯文本逐行
   const paragraphs = content.includes('<p')
@@ -95,27 +87,29 @@ export default function ReaderPage() {
       </div>
 
       <div className="reader-content" ref={scrollRef}
-        style={{ fontSize: `${fontSize}px`, paddingTop: showToolbar ? 20 : 48 }}
+        style={{ fontSize: `${fontSize}px`, paddingTop: showToolbar ? 16 : 48 }}
         onClick={() => setShowToolbar(s => !s)}>
-        {loading ? <div className="loading" style={{ color: theme.color }}><div className="spinner" />加载正文…</div>
-          : paragraphs.length === 0 ? <p>暂无正文内容</p>
-          : paragraphs.map((p, i) => <p key={i}>{p}</p>)}
+        <div className="reader-inner">
+          {loading ? <div className="loading" style={{ color: theme.color }}><div className="spinner" />加载正文…</div>
+            : paragraphs.length === 0 ? <p>暂无正文内容</p>
+            : paragraphs.map((p, i) => <p key={i}>{p}</p>)}
+        </div>
       </div>
 
       <div className="reader-bottombar" style={{ display: showToolbar ? 'flex' : 'none' }}>
         <button className="btn btn-ghost" disabled={index <= 0} onClick={() => setIndex(i => i - 1)}>上一章</button>
-        <button className="btn btn-ghost" onClick={cacheCurrent}>缓存</button>
+        <button className="btn btn-ghost" onClick={cacheCurrent}>缓存本章</button>
         <button className="btn btn-ghost" disabled={index >= chapters.length - 1} onClick={() => setIndex(i => i + 1)}>下一章</button>
       </div>
 
       {showSettings && (
         <div className="dialog-mask" onClick={() => setShowSettings(false)}>
           <div className="reader-setting" onClick={e => e.stopPropagation()}>
-            <h2 style={{ fontSize: 17, marginBottom: 12 }}>阅读设置</h2>
+            <h2 style={{ fontSize: 18, marginBottom: 14 }}>阅读设置</h2>
             <div style={{ fontSize: 13, color: '#757575' }}>字号</div>
             <div className="font-controls">
               <button onClick={() => changeFontSize(-1)}>A-</button>
-              <span style={{ flex: 1, textAlign: 'center' }}>{fontSize}px</span>
+              <span style={{ flex: 1, textAlign: 'center', fontWeight: 600 }}>{fontSize}px</span>
               <button onClick={() => changeFontSize(1)}>A+</button>
             </div>
             <div style={{ fontSize: 13, color: '#757575', marginTop: 12 }}>背景主题</div>
@@ -125,7 +119,7 @@ export default function ReaderPage() {
                   style={{ background: t.bg }} title={t.name} onClick={() => changeTheme(i)} />
               ))}
             </div>
-            <button className="btn btn-primary btn-block" style={{ marginTop: 20 }} onClick={() => setShowSettings(false)}>完成</button>
+            <button className="btn btn-primary btn-block" style={{ marginTop: 22 }} onClick={() => setShowSettings(false)}>完成</button>
           </div>
         </div>
       )}

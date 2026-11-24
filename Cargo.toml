@@ -2,7 +2,7 @@
 name = "reader"
 version = "0.1.0"
 edition = "2021"
-description = "Server-side Legado reader: Legado book sources, Rust engine, embedded web client"
+description = "Server-side reader: Rust engine, embedded web client, single binary"
 license = "AGPL-3.0-or-later"
 
 [[bin]]

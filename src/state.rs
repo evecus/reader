@@ -20,7 +20,7 @@ impl AppState {
     pub fn new(data_dir: PathBuf) -> AppResult<Self> {
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| crate::error::AppError::internal(format!("create data dir: {e}")))?;
-        let db = Arc::new(Db::open(&data_dir.join("legado.db"))?);
+        let db = Arc::new(Db::open(&data_dir.join("reader.db"))?);
         let books = Arc::new(BookService::new());
         let fetcher = Arc::new(Fetcher::new());
         let downloader = Arc::new(DownloadManager::new(db.clone(), books.clone()));
