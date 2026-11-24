@@ -27,6 +27,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/shelf/{book_url}", axum::routing::delete(remove_shelf))
         .route("/api/shelf/progress", axum::routing::patch(update_progress))
         .route("/api/cache", axum::routing::get(list_cache).delete(clear_cache))
+        .route("/api/cache/books", axum::routing::get(list_cache_books))
+        .route("/api/cache/chapters", axum::routing::get(list_cache_chapters))
+        .route("/api/cache/book", axum::routing::delete(delete_cache_book))
         .route("/api/cache/chapter", axum::routing::post(cache_chapter).delete(delete_cache))
         .route("/api/download", axum::routing::get(list_downloads).post(start_download).delete(clear_finished_downloads))
         .route("/api/download/{id}", axum::routing::get(get_download).delete(cancel_download))
@@ -179,6 +182,10 @@ async fn chapters(State(s): State<Arc<AppState>>, Query(p): Query<ChaptersParams
 struct ContentParams { origin: String, url: String, book_url: String, title: Option<String>, next_url: Option<String> }
 
 async fn content(State(s): State<Arc<AppState>>, Query(p): Query<ContentParams>) -> AppResult<Json<Value>> {
+    // 离线优先（对齐 legado）：已缓存的章节直接读缓存，不依赖书源在线
+    if let Ok(Some(c)) = s.db.get_cached(&p.book_url, &p.url) {
+        return Ok(Json(json!({ "content": c.content, "fromCache": true })));
+    }
     let sources = s.db.list_sources(false)?;
     let src = sources.iter().find(|x| x.book_source_url == p.origin)
         .ok_or_else(|| AppError::not_found("书源不存在"))?;
@@ -225,17 +232,47 @@ async fn list_cache(State(s): State<Arc<AppState>>) -> AppResult<Json<Value>> {
     let items = s.db.list_cached()?;
     let out: Vec<Value> = items.iter().map(|c| json!({
         "bookUrl": c.book_url, "chapterUrl": c.chapter_url, "title": c.title,
-        "cachedAt": c.cached_at, "size": c.content.len()
+        "origin": c.origin, "bookName": c.book_name, "bookAuthor": c.book_author,
+        "chapterIndex": c.chapter_index,
+        "cachedAt": c.cached_at, "size": c.size
     })).collect();
     Ok(Json(json!(out)))
 }
 
+/// 按书籍分组汇总（缓存页以书籍为单位展示）
+async fn list_cache_books(State(s): State<Arc<AppState>>) -> AppResult<Json<Value>> {
+    Ok(Json(json!(s.db.list_cached_books()?)))
+}
+
+/// 某本书已缓存的章节列表（离线阅读用，不含正文）
 #[derive(Debug, Deserialize)]
-struct CacheBody { book_url: String, chapter_url: String, title: String, content: String }
+struct CacheChaptersParams { book_url: String }
+async fn list_cache_chapters(State(s): State<Arc<AppState>>, Query(p): Query<CacheChaptersParams>) -> AppResult<Json<Value>> {
+    let items = s.db.list_cached_chapters_by_book(&p.book_url)?;
+    let out: Vec<Value> = items.iter().map(|c| json!({
+        "bookUrl": c.book_url, "chapterUrl": c.chapter_url, "title": c.title,
+        "origin": c.origin, "bookName": c.book_name, "bookAuthor": c.book_author,
+        "chapterIndex": c.chapter_index,
+        "cachedAt": c.cached_at, "size": c.size
+    })).collect();
+    Ok(Json(json!({ "chapters": out })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheBody {
+    book_url: String, chapter_url: String, title: String, content: String,
+    #[serde(default)] origin: String,
+    #[serde(default)] book_name: String,
+    #[serde(default)] book_author: String,
+    #[serde(default)] chapter_index: i64,
+}
 async fn cache_chapter(State(s): State<Arc<AppState>>, Json(body): Json<CacheBody>) -> AppResult<Json<Value>> {
     s.db.cache_chapter(&CachedChapter {
-        book_url: body.book_url, chapter_url: body.chapter_url, title: body.title,
-        content: body.content, cached_at: chrono::Utc::now().timestamp_millis(),
+        book_url: body.book_url, origin: body.origin,
+        book_name: body.book_name, book_author: body.book_author,
+        chapter_url: body.chapter_url, chapter_index: body.chapter_index,
+        title: body.title, content: body.content,
+        cached_at: chrono::Utc::now().timestamp_millis(), size: 0,
     })?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -245,6 +282,13 @@ struct DeleteCacheParams { book_url: String, chapter_url: String }
 async fn delete_cache(State(s): State<Arc<AppState>>, Query(p): Query<DeleteCacheParams>) -> AppResult<StatusCode> {
     s.db.delete_cached(&p.book_url, &p.chapter_url)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteCacheBookParams { book_url: String }
+async fn delete_cache_book(State(s): State<Arc<AppState>>, Query(p): Query<DeleteCacheBookParams>) -> AppResult<Json<Value>> {
+    let n = s.db.delete_cached_book(&p.book_url)?;
+    Ok(Json(json!({ "deleted": n })))
 }
 async fn clear_cache(State(s): State<Arc<AppState>>) -> AppResult<StatusCode> {
     s.db.clear_cached()?;

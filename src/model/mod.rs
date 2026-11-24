@@ -197,10 +197,34 @@ pub struct ShelfItem {
 #[serde(default, rename_all = "camelCase")]
 pub struct CachedChapter {
     pub book_url: String,
+    /// 书籍来源（书源 URL），用于缓存页按书打开阅读
+    pub origin: String,
+    /// 书籍名（缓存展示与按书分组用）
+    pub book_name: String,
+    /// 书籍作者
+    pub book_author: String,
     pub chapter_url: String,
+    /// 章节在目录中的序号，用于离线时按顺序阅读
+    pub chapter_index: i64,
     pub title: String,
     pub content: String,
     pub cached_at: i64,
+    /// 正文字节数（列表查询时随 length(content) 带回，不落库）
+    #[serde(default)]
+    pub size: i64,
+}
+
+/// 离线缓存按书籍分组汇总
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CachedBook {
+    pub book_url: String,
+    pub origin: String,
+    pub book_name: String,
+    pub book_author: String,
+    pub chapter_count: i64,
+    pub total_size: i64,
+    pub last_cached_at: i64,
 }
 
 /// 发现分类入口

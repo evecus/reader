@@ -1,7 +1,7 @@
 //! SQLite 持久层：书源、书架、缓存、配置。
 
 use crate::error::{AppError, AppResult};
-use crate::model::{BookSource, CachedChapter, ShelfItem};
+use crate::model::{BookSource, CachedBook, CachedChapter, ShelfItem};
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::path::Path;
@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS shelf (
 CREATE TABLE IF NOT EXISTS cached_chapters (
   book_url TEXT NOT NULL,
   chapter_url TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT '',
+  book_name TEXT NOT NULL DEFAULT '',
+  book_author TEXT NOT NULL DEFAULT '',
+  chapter_index INTEGER NOT NULL DEFAULT 0,
   title TEXT NOT NULL DEFAULT '',
   content TEXT NOT NULL,
   cached_at INTEGER NOT NULL,
@@ -71,7 +75,31 @@ impl Db {
             .map_err(|e| AppError::internal(format!("pragma: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| AppError::internal(format!("schema: {e}")))?;
+        Self::migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// 旧库迁移：cached_chapters 补齐新增列（对老数据无破坏，默认值回填）
+    fn migrate(conn: &Connection) -> AppResult<()> {
+        let mut cols: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(cached_chapters)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            for r in rows { cols.push(r?); }
+        }
+        let alter = [
+            ("origin", "TEXT NOT NULL DEFAULT ''"),
+            ("book_name", "TEXT NOT NULL DEFAULT ''"),
+            ("book_author", "TEXT NOT NULL DEFAULT ''"),
+            ("chapter_index", "INTEGER NOT NULL DEFAULT 0"),
+        ];
+        for (name, def) in alter {
+            if !cols.iter().any(|c| c == name) {
+                conn.execute_batch(&format!("ALTER TABLE cached_chapters ADD COLUMN {name} {def};"))
+                    .map_err(|e| AppError::internal(format!("migrate cached_chapters.{name}: {e}")))?;
+            }
+        }
+        Ok(())
     }
 
     fn conn(&self) -> AppResult<std::sync::MutexGuard<'_, Connection>> {
@@ -171,35 +199,84 @@ impl Db {
     // ---- 缓存 ----
     pub fn cache_chapter(&self, c: &CachedChapter) -> AppResult<()> {
         self.conn()?.execute(
-            "INSERT INTO cached_chapters(book_url,chapter_url,title,content,cached_at)
-             VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(book_url,chapter_url) DO UPDATE SET title=excluded.title,
+            "INSERT INTO cached_chapters(book_url,chapter_url,origin,book_name,book_author,chapter_index,title,content,cached_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(book_url,chapter_url) DO UPDATE SET origin=excluded.origin,
+               book_name=excluded.book_name, book_author=excluded.book_author,
+               chapter_index=excluded.chapter_index, title=excluded.title,
                content=excluded.content, cached_at=excluded.cached_at",
-            params![c.book_url, c.chapter_url, c.title, c.content, c.cached_at],
+            params![c.book_url, c.chapter_url, c.origin, c.book_name, c.book_author,
+                c.chapter_index, c.title, c.content, c.cached_at],
         )?;
         Ok(())
     }
 
     pub fn get_cached(&self, book_url: &str, chapter_url: &str) -> AppResult<Option<CachedChapter>> {
         let conn = self.conn()?;
-        let raw: Option<(String, String, i64)> = conn.query_row(
-            "SELECT title,content,cached_at FROM cached_chapters WHERE book_url=?1 AND chapter_url=?2",
-            params![book_url, chapter_url], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        let raw: Option<(String, String, String, String, String, i64, String, i64)> = conn.query_row(
+            "SELECT origin,book_name,book_author,title,content,chapter_index,chapter_url,cached_at
+             FROM cached_chapters WHERE book_url=?1 AND chapter_url=?2",
+            params![book_url, chapter_url],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
         ).optional()?;
-        Ok(raw.map(|(title, content, cached_at)| CachedChapter {
-            book_url: book_url.into(), chapter_url: chapter_url.into(), title, content, cached_at,
+        Ok(raw.map(|(origin, book_name, book_author, title, content, chapter_index, cu, cached_at)| {
+            let size = content.len() as i64;
+            CachedChapter {
+                book_url: book_url.into(), origin, book_name, book_author,
+                chapter_url: cu, chapter_index, title, content, cached_at, size,
+            }
         }))
     }
 
+    /// 列出全部缓存章节（content 置空，仅元数据），按章节序号排序
     pub fn list_cached(&self) -> AppResult<Vec<CachedChapter>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT book_url,chapter_url,title,length(content),cached_at FROM cached_chapters ORDER BY cached_at DESC"
+            "SELECT book_url,chapter_url,title,origin,book_name,book_author,chapter_index,length(content),cached_at
+             FROM cached_chapters ORDER BY book_url, chapter_index, cached_at"
         )?;
         let rows = stmt.query_map([], |r| Ok(CachedChapter {
             book_url: r.get(0)?, chapter_url: r.get(1)?, title: r.get(2)?,
-            content: String::new(), cached_at: r.get(4)?,
-            // 复用字段：用一个伪字段存字节数前端展示（实际 content 为空）
+            origin: r.get(3)?, book_name: r.get(4)?, book_author: r.get(5)?,
+            chapter_index: r.get(6)?,
+            content: String::new(), cached_at: r.get(8)?, size: r.get(7)?,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    /// 按书籍分组汇总缓存（缓存页以书籍为单位展示）
+    pub fn list_cached_books(&self) -> AppResult<Vec<CachedBook>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT book_url, MAX(origin), MAX(book_name), MAX(book_author),
+                    COUNT(*), SUM(length(content)), MAX(cached_at)
+             FROM cached_chapters GROUP BY book_url ORDER BY MAX(cached_at) DESC"
+        )?;
+        let rows = stmt.query_map([], |r| Ok(CachedBook {
+            book_url: r.get(0)?, origin: r.get(1)?,
+            book_name: r.get(2)?, book_author: r.get(3)?,
+            chapter_count: r.get(4)?, total_size: r.get(5)?, last_cached_at: r.get(6)?,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    /// 列出某本书的缓存章节（供离线阅读按序打开；不含正文）
+    pub fn list_cached_chapters_by_book(&self, book_url: &str) -> AppResult<Vec<CachedChapter>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT book_url,chapter_url,title,origin,book_name,book_author,chapter_index,length(content),cached_at
+             FROM cached_chapters WHERE book_url=?1
+             ORDER BY CASE WHEN chapter_index > 0 THEN chapter_index ELSE 4294967296 END, cached_at"
+        )?;
+        let rows = stmt.query_map(params![book_url], |r| Ok(CachedChapter {
+            book_url: r.get(0)?, chapter_url: r.get(1)?, title: r.get(2)?,
+            origin: r.get(3)?, book_name: r.get(4)?, book_author: r.get(5)?,
+            chapter_index: r.get(6)?,
+            content: String::new(), cached_at: r.get(8)?, size: r.get(7)?,
         }))?;
         let mut out = Vec::new();
         for row in rows { out.push(row?); }
@@ -212,6 +289,14 @@ impl Db {
             params![book_url, chapter_url],
         )?;
         Ok(())
+    }
+
+    /// 删除整本书的缓存（缓存页按书删除）
+    pub fn delete_cached_book(&self, book_url: &str) -> AppResult<usize> {
+        let n = self.conn()?.execute(
+            "DELETE FROM cached_chapters WHERE book_url=?1", params![book_url],
+        )?;
+        Ok(n)
     }
 
     pub fn clear_cached(&self) -> AppResult<()> {

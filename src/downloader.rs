@@ -234,10 +234,15 @@ async fn run_download(
                 Ok(content) => {
                     let cached = CachedChapter {
                         book_url: book_url.clone(),
+                        origin: book.origin.clone(),
+                        book_name: book.name.clone(),
+                        book_author: book.author.clone(),
                         chapter_url: ch.url.clone(),
+                        chapter_index: ch.index as i64,
                         title: ch.title.clone(),
                         content,
                         cached_at: chrono::Utc::now().timestamp_millis(),
+                        size: 0,
                     };
                     match db.cache_chapter(&cached) {
                         Ok(_) => (true, false),

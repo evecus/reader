@@ -34,10 +34,11 @@ export default function ChapterListPage() {
 
   const openReader = (index: number) => {
     const c = chapters[index]
+    // 目录改为阅读页内通过 API 获取，避免长书章节 JSON 撑爆 URL
     const q = new URLSearchParams({
-      origin, url: c.url, book_url: info.bookUrl,
-      title: c.title, name, author,
-      chapters: JSON.stringify(chapters), index: String(index),
+      origin, book_url: info.bookUrl,
+      toc_url: tocUrl || info.bookUrl,
+      title: c.title, name, author, index: String(index),
     })
     navigate(`/reader?${q}`)
   }
@@ -45,10 +46,13 @@ export default function ChapterListPage() {
   const cacheAll = async () => {
     toast(`准备缓存 ${chapters.length} 章（逐章下载中）`)
     let ok = 0
-    for (const c of chapters) {
+    for (const [i, c] of chapters.entries()) {
       try {
         const r = await api.content(origin, c.url, info.bookUrl, c.title)
-        await api.cacheChapter({ book_url: info.bookUrl, chapter_url: c.url, title: c.title, content: r.content })
+        await api.cacheChapter({
+          book_url: info.bookUrl, chapter_url: c.url, title: c.title, content: r.content,
+          origin, book_name: name, book_author: author, chapter_index: c.index ?? i,
+        })
         ok++
       } catch { /* 跳过失败章节 */ }
     }

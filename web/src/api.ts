@@ -1,4 +1,4 @@
-import type { Book, BookChapter, BookSource, CacheItem, ShelfItem, DownloadTask } from './types'
+import type { Book, BookChapter, BookSource, CacheBook, CacheItem, ShelfItem, DownloadTask } from './types'
 
 async function req<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(path, options)
@@ -67,10 +67,17 @@ export const api = {
     }),
 
   listCache: () => req<CacheItem[]>('/api/cache'),
-  cacheChapter: (data: { book_url: string; chapter_url: string; title: string; content: string }) =>
+  // 按书籍分组汇总（缓存页以书籍为单位展示）
+  listCacheBooks: () => req<CacheBook[]>('/api/cache/books'),
+  // 某本书已缓存的章节列表（离线阅读用）
+  listCacheChapters: (bookUrl: string) =>
+    req<{ chapters: CacheItem[] }>(`/api/cache/chapters?${new URLSearchParams({ book_url: bookUrl })}`),
+  cacheChapter: (data: { book_url: string; chapter_url: string; title: string; content: string; origin?: string; book_name?: string; book_author?: string; chapter_index?: number }) =>
     req<{ ok: boolean }>('/api/cache/chapter', { method: 'POST', ...json(data) }),
   deleteCache: (bookUrl: string, chapterUrl: string) =>
     req<void>(`/api/cache/chapter?${new URLSearchParams({ book_url: bookUrl, chapter_url: chapterUrl })}`, { method: 'DELETE' }),
+  deleteCacheBook: (bookUrl: string) =>
+    req<{ deleted: number }>(`/api/cache/book?${new URLSearchParams({ book_url: bookUrl })}`, { method: 'DELETE' }),
   clearCache: () => req<void>('/api/cache', { method: 'DELETE' }),
 
   // 整本书后台下载

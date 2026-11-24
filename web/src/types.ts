@@ -54,8 +54,22 @@ export interface CacheItem {
   bookUrl: string
   chapterUrl: string
   title: string
+  origin?: string
+  bookName?: string
+  bookAuthor?: string
+  chapterIndex?: number
   cachedAt: number
   size: number
+}
+
+export interface CacheBook {
+  bookUrl: string
+  origin: string
+  bookName: string
+  bookAuthor: string
+  chapterCount: number
+  totalSize: number
+  lastCachedAt: number
 }
 
 export interface DownloadTask {
