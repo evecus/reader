@@ -207,11 +207,18 @@ fn parse_piece(raw: &str) -> RulePiece {
     }
 
     // 拆分 ## ：selector##regex##replacement##first
-    let mut parts = s.splitn(4, "##");
-    let head = parts.next().unwrap_or("").to_string();
-    let replace_regex = parts.next().unwrap_or("").to_string();
-    let replacement = parts.next().unwrap_or("").to_string();
-    let replace_first = parts.next().is_some();
+    // 对齐 legado：Mode.Js 规则（@js: / <js>...）整段交给 JS 求值，
+    // 不做 ## 拆分（JS 里的 ## 与 $N 都是脚本字面量）。
+    let (head, replace_regex, replacement, replace_first) = if mode == Mode::Js {
+        (s, String::new(), String::new(), false)
+    } else {
+        let mut parts = s.splitn(4, "##");
+        let head = parts.next().unwrap_or("").to_string();
+        let replace_regex = parts.next().unwrap_or("").to_string();
+        let replacement = parts.next().unwrap_or("").to_string();
+        let replace_first = parts.next().is_some();
+        (head, replace_regex, replacement, replace_first)
+    };
 
     // 内联片段拆分：@get:{} / {{...}} / $N
     let segments = split_segments(&head, &mut mode);
@@ -264,7 +271,9 @@ fn push_text_segments(out: &mut Vec<Segment>, text: &str, mode: &mut Mode) {
         }
         let n: usize = m.as_str()[1..].parse().unwrap_or(0);
         if n > 0 {
-            if *mode == Mode::Default || *mode == Mode::Js { *mode = Mode::Regex; }
+            // 对齐 legado AnalyzeRule.splitRegex：仅 Default 模式切 Regex；
+            // Js/WebJs 规则里的 $1 是 JS 字面量（如 '$1'），绝不能切模式。
+            if *mode == Mode::Default { *mode = Mode::Regex; }
             out.push(Segment::RegexGroup(n));
         }
         last = m.end();

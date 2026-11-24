@@ -354,9 +354,15 @@ impl BookService {
         let mut nexts: Vec<String> = Vec::new();
         if get_next {
             if let Some(r) = rule.next_toc_url.as_deref().filter(|s| !s.is_empty()) {
-                for u in ctx.get_string_list(r)? {
-                    let abs = absolute_url(page_url, &u);
-                    if !abs.is_empty() && abs != page_url && !nexts.contains(&abs) { nexts.push(abs); }
+                // 下一页规则失败不拖垮整个目录（对齐官方容错）
+                match ctx.get_string_list(r) {
+                    Ok(list) => {
+                        for u in list {
+                            let abs = absolute_url(page_url, &u);
+                            if !abs.is_empty() && abs != page_url && !nexts.contains(&abs) { nexts.push(abs); }
+                        }
+                    }
+                    Err(e) => tracing::warn!("目录下一页规则解析失败: {}", e.message),
                 }
             }
         }
@@ -460,9 +466,15 @@ impl BookService {
         let mut nexts: Vec<String> = Vec::new();
         if get_next {
             if let Some(r) = rule.next_content_url.as_deref().filter(|s| !s.is_empty()) {
-                for u in ctx.get_string_list(r)? {
-                    let abs = absolute_url(page_url, &u);
-                    if !abs.is_empty() && abs != page_url && !nexts.contains(&abs) { nexts.push(abs); }
+                // 下一页规则失败不影响正文本身（对齐官方容错）
+                match ctx.get_string_list(r) {
+                    Ok(list) => {
+                        for u in list {
+                            let abs = absolute_url(page_url, &u);
+                            if !abs.is_empty() && abs != page_url && !nexts.contains(&abs) { nexts.push(abs); }
+                        }
+                    }
+                    Err(e) => tracing::warn!("正文下一页规则解析失败: {}", e.message),
                 }
             }
         }
@@ -615,5 +627,27 @@ mod pagination_tests {
         // 不知道下一章时，会把“下一章”也并进来（与官方一致，所以 API/下载器要传 next_url）
         let text2 = svc.content_with_next(&src, &book, &ch, None).await.unwrap();
         assert_eq!(text2, "第一页内容\n第二页内容\n下一章内容");
+    }
+
+    /// 回归：@js: 正文规则里含 $N 引用与 {} 代码块时，
+    /// 必须整体按 JS 求值，不能被切成正则模式（曾导致"暂无正文内容"）。
+    #[tokio::test]
+    async fn content_js_rule_with_dollar_refs_and_braces() {
+        let port = spawn_server().await;
+        let svc = service();
+        let src: BookSource = serde_json::from_value(serde_json::json!({
+            "bookSourceUrl": format!("http://127.0.0.1:{}", port),
+            "bookSourceName": "JS源",
+            "ruleContent": {
+                "content": "@js:(function(){var re=/id=[\"']?content[\"']?[^>]*>([\\s\\S]*?)<\\/div/i;var m=re.exec(result);if(!m)return'';var p=m[1];var t={n:1};return String('$1')+p+t.n;})()",
+                "nextContentUrl": "@js:(function(){var best='';var re=/<a[^>]*href=\"([^\"]+)\"[^>]*>[\\s\\S]*?<\\/a>/g;var m;while((m=re.exec(result))!==null){var u=abs(m[1]);if(/^javascript:/i.test(u)||u==='')continue;var t={best:u};best=t.best;break;}function abs(u){return u;}return best;})()"
+            }
+        })).unwrap();
+        let book = Book::default();
+        let ch = BookChapter { url: format!("http://127.0.0.1:{}/c/1", port), ..Default::default() };
+        let text = svc.content_with_next(&src, &book, &ch, None).await.unwrap();
+        // /c/1 页面正文为 "第一页内容"，JS 规则拼接了清洗文本与 '$1' 字面量
+        assert!(text.contains("第一页内容"), "实际正文: {}", text);
+        assert!(text.contains("$1"), "JS 字面量 $1 不应被当正则组解析: {}", text);
     }
 }
