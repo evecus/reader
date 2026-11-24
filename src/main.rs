@@ -1,5 +1,6 @@
 mod api;
 mod book;
+mod cookie;
 mod db;
 mod downloader;
 mod engine;

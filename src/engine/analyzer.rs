@@ -39,8 +39,6 @@ pub struct RulePiece {
     pub replace_regex: String,         // ## 后第 1 段
     pub replacement: String,           // ## 后第 2 段
     pub replace_first: bool,           // ## 后第 3 段存在
-    /// 逻辑连接符：本组内部的连接方式（&& / || / %%），由 split_logic 决定
-    pub connectors: Vec<String>,
     /// <js>...</js> 前缀脚本：先执行得到字符串，再作为后续规则的求值内容
     pub js_prefix: Option<String>,
 }
@@ -67,8 +65,6 @@ pub struct ParsedRule {
     pub pieces: Vec<RulePiece>,
     /// piece 之间的连接符（&& / || / %%），长度 = pieces.len()-1
     pub separators: Vec<String>,
-    pub reverse: bool, // 首字符 '-' 表示反转
-    pub no_reverse: bool, // 首字符 '+' 表示不反转
 }
 
 static PUT_RE: OnceLock<Regex> = OnceLock::new();
@@ -89,14 +85,14 @@ fn regex_group_re() -> &'static Regex {
 /// 主入口：解析一条规则字符串
 pub fn parse_rule(input: &str) -> ParsedRule {
     let mut s = input.trim().to_string();
-    let reverse = s.starts_with('-');
-    let no_reverse = s.starts_with('+');
-    if reverse || no_reverse { s = s[1..].to_string(); }
+    // 首字符 '-' / '+' 是目录反转前缀，由业务层（BookService::chapters）处理；
+    // 此处仅剥离，避免残留进选择器。reverse 语义不在规则解析器内生效。
+    if s.starts_with('-') || s.starts_with('+') { s = s[1..].to_string(); }
 
     // 第一层：按 && / || / %% 分割（用平衡感知的切分）
     let (raw_pieces, separators) = split_logic(&s);
     let pieces = raw_pieces.into_iter().map(|p| parse_piece(&p)).collect();
-    ParsedRule { pieces, separators, reverse, no_reverse }
+    ParsedRule { pieces, separators }
 }
 
 /// 平衡感知的逻辑分割：&& || %%
@@ -221,7 +217,7 @@ fn parse_piece(raw: &str) -> RulePiece {
 
     RulePiece {
         mode, segments, put_map, replace_regex, replacement, replace_first,
-        connectors: Vec::new(), js_prefix,
+        js_prefix,
     }
 }
 

@@ -25,11 +25,21 @@
 | `@js:` / `<js>` / `{{...}}`（jsLib） | ✅ QuickJS |
 | jsUrl：searchUrl/exploreUrl 用 `<js>...</js>` 脚本构造 | ✅（注入 key/page/source/java.ajax） |
 | `<js>...</js>` 前缀 + 选择器组合（如目录 `<js>...</js>$[*]`） | ✅ |
-| `url,{"headers":{...}}` 请求选项 / POST body | ✅ |
-| `##` 正则替换 / `&&` `\|\|` `%%` 组合 | ✅ |
+| `url,{"method":"POST","body":...}` 请求选项（method/body/headers/charset/retry/timeout） | ✅ 四链路统一消费，支持 POST 搜索 |
+| `java.ajax({url,method,body,headers})` 带选项请求 | ✅ headers/method/body 不再丢弃 |
+| `##` 正则替换 | ✅ |
+| `&&` 并集 / `\|\|` 择一 / `%%` 交织 组合符 | ✅（按官方 `AnalyzeByJSoup` 语义） |
+| `a@text` 等多步 CSS 链修饰规则 | ✅ |
+| 目录 `-` 前缀（书源已正序不反转） | ✅ |
 | `@get:{}` / `@put:{}` 变量 | ✅ |
+| `java.put/get` + `source.getVariable/setVariable` 变量持久化（SQLite） | ✅ 跨请求保留登录态 |
+| Cookie jar（域级隔离、Set-Cookie 自动回写、Cookie 请求头注入、`java.getCookie`） | ✅ 进程级共享 |
+| 内置 CryptoJS（MD5/SHA1/SHA256/AES/Hmac/Hex/Base64） | ✅ 官方 64KB 原版按需注入，签名型书源可用 |
+| `java.md5Encode/md5Encode16/digestHex/digestBase64Str/HMacHex/HMacBase64` | ✅ 对齐官方 `JsEncodeUtils` |
+| `java.aesEncode/aesDecode`（ECB/CBC，PKCS5/7/NoPadding，128/192/256） | ✅ + ArgsBase64 变体 |
+| 响应编码：显式 charset / meta charset 探测（GBK/GB18030/Big5 等） | ✅ |
 
-> 说明：依赖 Legado 私有运行机制（如 `source.getVariable()` 登录态、`java.startBrowser()`、VIP 渲染面板等）的聚合/插件型书源，可能仅搜索/详情/目录可用，正文无法完整复现。
+> 说明：依赖 Legado 私有运行机制（如 `java.startBrowser()`、VIP 渲染面板、WebView 动态渲染、字体反混淆等）的聚合/插件型书源，可能仅搜索/详情/目录可用，正文无法完整复现。变量与 Cookie 已跨请求持久化，登录型书源多数场景可读正文；内置 CryptoJS 与 java.* 加密绑定覆盖了签名型书源（无需书源自带 jsLib）。仍缺的集中在 `@webjs:`/WebView 渲染、字体反混淆、目录/正文分页（`nextTocUrl`/`nextContentUrl`）、DES/非对称加密等。
 
 ## 运行
 
@@ -74,11 +84,15 @@ docker run -d -p 5888:5888 -v ./data:/data reader
 
 ```
 src/
-├── engine/          # 规则引擎：切分器/求值器/JS/选择器/XPath
+├── engine/          # 规则引擎：切分器/求值器/JS/选择器/XPath/加密
+│   └── crypto.rs    # 摘要/HMac/AES（对齐 java.* 加密方法）
+├── assets/
+│   └── cryptojs.min.js  # 官方内置 CryptoJS（按需注入 QuickJS）
 ├── book.rs          # 四条业务链路
 ├── downloader.rs    # 整书后台下载任务管理
-├── fetcher.rs       # URL 替换/编码探测/HTTP
-├── db.rs            # SQLite 存储
+├── fetcher.rs       # RequestSpec 选项解析/编码探测/HTTP（含 POST/Cookie/charset/retry）
+├── cookie.rs        # 轻量 Cookie jar（域级隔离 / Set-Cookie 回写）
+├── db.rs            # SQLite 存储（书源变量持久化表）
 ├── api/             # REST 路由
 └── main.rs          # 服务入口 + 静态资源内嵌
 web/src/pages/       # 8 个前端页面

@@ -1,7 +1,7 @@
 //! SQLite 持久层：书源、书架、缓存、配置。
 
 use crate::error::{AppError, AppResult};
-use crate::model::{Book, BookSource, CachedChapter, ShelfItem};
+use crate::model::{BookSource, CachedChapter, ShelfItem};
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::path::Path;
@@ -46,6 +46,13 @@ CREATE TABLE IF NOT EXISTS cached_chapters (
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+-- 书源级持久化变量（对应 Legado source.getVariable/setVariable、登录态）
+CREATE TABLE IF NOT EXISTS source_variables (
+  source_url TEXT PRIMARY KEY,
+  variables TEXT NOT NULL DEFAULT '{}',
+  updated_at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_shelf_book ON shelf(book_url);
@@ -237,6 +244,31 @@ impl Db {
             map.insert(k, Value::String(v));
         }
         Ok(map)
+    }
+
+    // ---- 书源持久化变量（登录态 / sourceVariables）----
+    /// 读取书源变量 JSON 对象；不存在返回 `{}`
+    pub fn get_source_variables(&self, source_url: &str) -> AppResult<Value> {
+        let raw: Option<String> = self.conn()?.query_row(
+            "SELECT variables FROM source_variables WHERE source_url=?1",
+            params![source_url], |r| r.get(0),
+        ).optional()?;
+        match raw {
+            Some(s) => serde_json::from_str(&s).map_err(Into::into),
+            None => Ok(Value::Object(Default::default())),
+        }
+    }
+
+    /// 覆写书源变量 JSON（同一书源串行更新，避免并发覆盖）
+    pub fn set_source_variables(&self, source_url: &str, variables: &Value) -> AppResult<()> {
+        let raw = serde_json::to_string(variables)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        self.conn()?.execute(
+            "INSERT INTO source_variables(source_url,variables,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(source_url) DO UPDATE SET variables=excluded.variables, updated_at=excluded.updated_at",
+            params![source_url, raw, now],
+        )?;
+        Ok(())
     }
 }
 

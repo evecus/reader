@@ -100,3 +100,40 @@ pub fn css_elements(html: &str, selector: &str) -> Result<Vec<String>, String> {
     let sel = Selector::parse(selector).map_err(|e| format!("CSS '{}': {:?}", selector, e))?;
     Ok(doc.select(&sel).map(|e| e.html()).collect())
 }
+
+/// 多步 CSS 链 + 末尾修饰符：对齐 Legado `AnalyzeByJSoup.getResultList`。
+///
+/// 形如 `a@text` / `div.item a@href` / `ul li@ownText`：
+/// 用 `@` 把规则切成若干步，前 n-1 步是 CSS 选择器（逐步缩小元素集合），
+/// 最后一步是修饰符（text / ownText / textNodes / html / all / 属性名）。
+/// 这样 `element_values(rule="a@text")` 不再被误当成"取名为 `a@text` 的属性"而返回空。
+pub fn chained_attr_or_text(html: &str, rule: &str) -> Vec<String> {
+    let parts: Vec<&str> = rule.split('@').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return element_attr_or_text(html, "");
+    }
+    if parts.len() == 1 {
+        // 无 @ 链：退化为原有的单步属性/文本提取
+        return element_attr_or_text(html, parts[0]);
+    }
+
+    // 每一步都在上一步的结果集合内继续 select
+    let mut current = vec![html.to_string()];
+    for selector in &parts[..parts.len() - 1] {
+        let mut next = Vec::new();
+        for h in &current {
+            if let Ok(els) = css_elements(h, selector) {
+                next.extend(els);
+            }
+        }
+        current = next;
+        if current.is_empty() { break; }
+    }
+
+    let modifier = parts[parts.len() - 1];
+    let mut out = Vec::new();
+    for h in &current {
+        out.extend(element_attr_or_text(h, modifier));
+    }
+    out
+}

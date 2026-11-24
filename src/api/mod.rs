@@ -8,9 +8,8 @@ use axum::{
     http::StatusCode,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub fn router(state: Arc<AppState>) -> Router {

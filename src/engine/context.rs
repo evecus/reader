@@ -1,20 +1,22 @@
 //! AnalyzeRule 求值器：规则切分 → 模式路由 → 内联 JS → 替换清洗。
 
+use crate::cookie::CookieStore;
 use crate::engine::analyzer::{parse_rule, Mode, ParsedRule, RulePiece, Segment};
-use crate::engine::js::{self, JsContext};
+use crate::engine::js::{self, new_var_store, JsContext, VarStore};
 use crate::engine::selector::{apply_replace, css_select, json_select, regex_extract};
-use crate::engine::value::{css_elements, element_attr_or_text, EvalValue};
+use crate::engine::value::{css_elements, element_attr_or_text, chained_attr_or_text, EvalValue};
 use crate::engine::xpath::{xpath_elements, xpath_select};
 use crate::error::{AppError, AppResult};
 use serde_json::Value;
-use std::collections::HashMap;
 
 pub struct RuleContext {
     pub html: String,
     pub base_url: String,
     pub js_lib: String,
-    pub variables: HashMap<String, String>,
+    /// 与 JS 层共享的变量表（java.put / source.setVariable / 规则 @put 共用）
+    pub variables: VarStore,
     pub fetch: Option<std::sync::Arc<dyn Fn(&str, &str) -> String + Send + Sync>>,
+    pub cookies: CookieStore,
     pub chapter_title: String,
 }
 
@@ -22,25 +24,44 @@ impl RuleContext {
     pub fn new(html: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             html: html.into(), base_url: base_url.into(), js_lib: String::new(),
-            variables: HashMap::new(), fetch: None, chapter_title: String::new(),
+            variables: new_var_store(), fetch: None, cookies: CookieStore::new(),
+            chapter_title: String::new(),
         }
     }
 
+    fn var(&self, key: &str) -> Option<String> {
+        self.variables.lock().ok().and_then(|m| m.get(key).cloned())
+    }
+    fn set_var(&self, key: String, value: String) {
+        if let Ok(mut m) = self.variables.lock() { m.insert(key, value); }
+    }
+
     fn js_ctx(&self, result: impl Into<String>) -> JsContext {
+        let login_info = new_var_store();
+        if let Some(raw) = self.var("loginInfo") {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&raw) {
+                if let Ok(mut m) = login_info.lock() {
+                    for (k, v) in map {
+                        m.insert(k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string());
+                    }
+                }
+            }
+        }
         JsContext {
             js_lib: self.js_lib.clone(),
             result: result.into(),
             base_url: self.base_url.clone(),
-            source_url: self.variables.get("sourceUrl").cloned().unwrap_or_default(),
-            source_name: self.variables.get("sourceName").cloned().unwrap_or_default(),
-            book_name: self.variables.get("bookName").cloned().unwrap_or_default(),
+            source_url: self.var("sourceUrl").unwrap_or_default(),
+            source_name: self.var("sourceName").unwrap_or_default(),
+            book_name: self.var("bookName").unwrap_or_default(),
             chapter_title: self.chapter_title.clone(),
             variables: self.variables.clone(),
             fetch: self.fetch.clone(),
-            key: self.variables.get("key").cloned().unwrap_or_default(),
-            page: self.variables.get("page").and_then(|v| v.parse().ok()).unwrap_or(1),
-            source_variables: self.variables.get("sourceVariables").cloned().unwrap_or_else(|| "{}".into()),
-            login_info: HashMap::new(),
+            cookies: self.cookies.clone(),
+            key: self.var("key").unwrap_or_default(),
+            page: self.var("page").and_then(|v| v.parse().ok()).unwrap_or(1),
+            login_info,
+            ..Default::default()
         }
     }
 
@@ -56,12 +77,19 @@ impl RuleContext {
         self.eval_list(&parsed)
     }
 
-    /// 求元素列表（返回每个元素的 outerHTML）
+    /// 求元素列表（返回每个元素的 outerHTML）。组合符语义同 eval_pieces。
     pub fn get_elements(&mut self, rule: &str) -> AppResult<Vec<String>> {
         if rule.is_empty() { return Ok(vec![]); }
-        let pieces: Vec<RulePiece> = parse_rule(rule).pieces;
-        let mut acc: Vec<String> = Vec::new();
-        for piece in &pieces {
+        let parsed = parse_rule(rule);
+        let pieces = &parsed.pieces;
+        let mut results: Vec<Vec<String>> = Vec::new();
+        for (i, piece) in pieces.iter().enumerate() {
+            if i > 0
+                && parsed.separators.get(i - 1).map(|s| s.as_str()) == Some("||")
+                && !results.is_empty()
+            {
+                break;
+            }
             let els = if let Some(js) = &piece.js_prefix {
                 // <js>...</js> 前缀：先执行脚本，结果作为后续选择器的求值内容
                 let jc = self.js_ctx(self.html.clone());
@@ -70,6 +98,7 @@ impl RuleContext {
                 sub.js_lib = self.js_lib.clone();
                 sub.variables = self.variables.clone();
                 sub.fetch = self.fetch.clone();
+                sub.cookies = self.cookies.clone();
                 let selector = sub.expand_segments(piece)?;
                 sub.select_elements(&selector, piece.mode)?
             } else {
@@ -78,11 +107,11 @@ impl RuleContext {
             };
             for (k, expr) in &piece.put_map {
                 let v = self.get_string(expr)?;
-                self.variables.insert(k.clone(), v);
+                self.set_var(k.clone(), v);
             }
-            acc.extend(els);
+            if !els.is_empty() { results.push(els); }
         }
-        Ok(acc)
+        Ok(merge_results(results, &parsed.separators))
     }
 
     /// 从元素列表取字段值
@@ -98,11 +127,11 @@ impl RuleContext {
             for html in elements {
                 let mut sub = RuleContext::new(html.clone(), self.base_url.clone());
                 sub.js_lib = self.js_lib.clone();
-                sub.variables = self.variables.clone();
+                sub.variables = self.variables.clone(); // 共享同一张表，JS 写入自动可见
                 sub.fetch = self.fetch.clone();
+                sub.cookies = self.cookies.clone();
                 let values = sub.get_string_list(rule)?;
                 for v in values { if !v.is_empty() { out.push(v); } }
-                for (k, v) in sub.variables { self.variables.insert(k, v); }
             }
             return Ok(out);
         }
@@ -121,44 +150,48 @@ impl RuleContext {
             return Ok(out);
         }
         let mut out = Vec::new();
-        for html in elements { out.extend(element_attr_or_text(html, rule)); }
+        for html in elements { out.extend(chained_attr_or_text(html, rule)); }
         Ok(out)
     }
 
-    fn eval_string(&mut self, parsed: &ParsedRule) -> AppResult<String> {
-        let mut outputs: Vec<String> = Vec::new();
+    /// 逐 piece 求值并按分隔符合并。语义对齐 Legado `AnalyzeByJSoup`：
+    /// - `&&`（默认）：所有非空结果顺序拼接（并集）
+    /// - `||`（择一）：遇到第一个非空结果即停止
+    /// - `%%`（交织）：按索引轮流从每组结果取值
+    fn eval_pieces(&mut self, parsed: &ParsedRule) -> AppResult<Vec<String>> {
+        let mut results: Vec<Vec<String>> = Vec::new();
         for (i, piece) in parsed.pieces.iter().enumerate() {
-            if i > 0 && parsed.separators.get(i - 1).map(|s| s.as_str()) == Some("||")
-                && !outputs.is_empty() { break; }
+            // || 择一：前一分隔符为 || 且已有非空结果，停止求值后续规则
+            if i > 0
+                && parsed.separators.get(i - 1).map(|s| s.as_str()) == Some("||")
+                && !results.is_empty()
+            {
+                break;
+            }
             let val = self.eval_piece_value(piece)?;
+            let mut group = Vec::new();
             for v in val.as_list() {
                 let s = apply_piece_replace(&v.as_str(), piece);
-                if !s.is_empty() { outputs.push(s); }
+                if !s.is_empty() { group.push(s); }
             }
             self.apply_puts(piece)?;
+            if !group.is_empty() { results.push(group); }
         }
-        Ok(outputs.join("\n"))
+        Ok(merge_results(results, &parsed.separators))
+    }
+
+    fn eval_string(&mut self, parsed: &ParsedRule) -> AppResult<String> {
+        Ok(self.eval_pieces(parsed)?.join("\n"))
     }
 
     fn eval_list(&mut self, parsed: &ParsedRule) -> AppResult<Vec<String>> {
-        let mut outputs: Vec<String> = Vec::new();
-        for (i, piece) in parsed.pieces.iter().enumerate() {
-            if i > 0 && parsed.separators.get(i - 1).map(|s| s.as_str()) == Some("||")
-                && !outputs.is_empty() { break; }
-            let val = self.eval_piece_value(piece)?;
-            for v in val.as_list() {
-                let s = apply_piece_replace(&v.as_str(), piece);
-                if !s.is_empty() { outputs.push(s); }
-            }
-            self.apply_puts(piece)?;
-        }
-        Ok(outputs)
+        self.eval_pieces(parsed)
     }
 
     fn apply_puts(&mut self, piece: &RulePiece) -> AppResult<()> {
         for (k, expr) in &piece.put_map {
             let v = self.get_string(expr)?;
-            self.variables.insert(k.clone(), v);
+            self.set_var(k.clone(), v);
         }
         Ok(())
     }
@@ -223,7 +256,7 @@ impl RuleContext {
                     s.push_str(&js::eval(expr, &jc)?);
                 }
                 Segment::GetVar(name) => {
-                    if let Some(v) = self.variables.get(name).cloned() { s.push_str(&v); }
+                    if let Some(v) = self.var(name) { s.push_str(&v); }
                 }
                 Segment::RegexGroup(n) => s.push_str(&format!("${}", n)),
             }
@@ -254,6 +287,78 @@ impl RuleContext {
     }
 }
 
-fn apply_piece_replace(s: &str, piece: &RulePiece) -> String {
+fn apply_piece_replace(s: &str, piece: &crate::engine::analyzer::RulePiece) -> String {
     apply_replace(s.to_string(), &piece.replace_regex, &piece.replacement, piece.replace_first)
+}
+
+/// 按分隔符合并各规则段的结果，对齐 Legado `AnalyzeByJSoup`：
+/// - 任一分隔符为 `%%`：按索引交织（i=0 取各组第 0 个，i=1 取各组第 1 个……）
+/// - 其余（`&&` 或单规则）：顺序拼接所有非空组
+/// （`||` 择一已在调用方循环里通过 break 实现）
+pub(crate) fn merge_results(results: Vec<Vec<String>>, separators: &[String]) -> Vec<String> {
+    if results.is_empty() { return Vec::new(); }
+    if separators.iter().any(|s| s == "%%") {
+        let max = results.iter().map(|g| g.len()).max().unwrap_or(0);
+        let mut out = Vec::new();
+        for i in 0..max {
+            for group in &results {
+                if i < group.len() { out.push(group[i].clone()); }
+            }
+        }
+        out
+    } else {
+        results.into_iter().flatten().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sep(s: &str) -> Vec<String> { vec![s.to_string()] }
+
+    #[test]
+    fn merge_and_concatenates() {
+        let r = merge_results(vec![vec!["a".into(), "b".into()], vec!["c".into()]], &sep("&&"));
+        assert_eq!(r, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn merge_interleave() {
+        // 官方 %% 交织：i=0 取各组第0个，i=1 取各组第1个……
+        let r = merge_results(
+            vec![vec!["a1".into(), "a2".into()], vec!["b1".into(), "b2".into()]],
+            &sep("%%"),
+        );
+        assert_eq!(r, vec!["a1", "b1", "a2", "b2"]);
+        // 长度不等时不越界
+        let r2 = merge_results(
+            vec![vec!["a1".into(), "a2".into()], vec!["b1".into()]],
+            &sep("%%"),
+        );
+        assert_eq!(r2, vec!["a1", "b1", "a2"]);
+    }
+
+    #[test]
+    fn chained_text_rule() {
+        // a@text 多步链：从 <div><a>标题</a></div> 中取 a 的文本
+        let out = chained_attr_or_text("<div><a href='/x'>标题</a></div>", "a@text");
+        assert_eq!(out, vec!["标题"]);
+        let out2 = chained_attr_or_text("<div><a href='/x'>标题</a></div>", "a@href");
+        assert_eq!(out2, vec!["/x"]);
+    }
+
+    #[test]
+    fn eval_and_or_rules() {
+        let mut ctx = RuleContext::new("<div><p class='a'>A</p><p class='b'>B</p></div>", "http://x/");
+        // && 并集：两个选择器结果拼接
+        let s = ctx.get_string("p.a@text&&p.b@text").unwrap();
+        assert_eq!(s, "A\nB");
+        // || 择一：第一个有结果即停
+        let s2 = ctx.get_string("p.a@text||p.b@text").unwrap();
+        assert_eq!(s2, "A");
+        // %% 交织
+        let s3 = ctx.get_string("p.a@text%%p.b@text").unwrap();
+        assert_eq!(s3, "A\nB");
+    }
 }
