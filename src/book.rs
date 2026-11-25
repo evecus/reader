@@ -71,7 +71,8 @@ impl BookService {
     }
 
     fn make_context(&self, html: String, base_url: String, source: &BookSource, vars: &VarStore) -> RuleContext {
-        let mut ctx = RuleContext::new(html, base_url);
+        let mut ctx = RuleContext::new(html, base_url.clone());
+        ctx.set_redirect_url(&base_url);
         ctx.js_lib = source.js_lib.clone().unwrap_or_default();
         ctx.variables = vars.clone();
         ctx.cookies = self.fetcher.cookies.clone();
@@ -118,7 +119,32 @@ impl BookService {
                 return Ok(u);
             }
         }
-        Ok(Fetcher::prepare_url(raw, key, Some(page)))
+        // 官方 AnalyzeUrl：`<a,b,c>` 按页取值；`{{expr}}` 为 JS 表达式（可用 key/page/java/source）
+        let mut raw = raw.to_string();
+        if let Ok(re) = regex::Regex::new(r"<([^<>]*,[^<>]*)>") {
+            raw = re.replace_all(&raw, |c: &regex::Captures| {
+                let v: Vec<&str> = c[1].split(',').collect();
+                v[((page - 1).max(0) as usize).min(v.len() - 1)].to_string()
+            }).to_string();
+        }
+        if raw.contains("{{") {
+            let vars = self.js_url_vars(source, key, page);
+            let mut ctx = self.make_context(String::new(), source.book_source_url.clone(), source, &vars);
+            ctx.key = key.unwrap_or("").to_string();
+            ctx.page = page;
+            ctx.source_url = source.book_source_url.clone();
+            ctx.source_name = source.book_source_name.clone();
+            if let Ok(re) = regex::Regex::new(r"\{\{(.+?)\}\}") {
+                let simple = |e: &str| e == "key" || e == "page" || e.starts_with("page:");
+                raw = re.replace_all(&raw, |c: &regex::Captures| {
+                    let e = c[1].trim();
+                    if simple(e) { return c[0].to_string(); }
+                    ctx.get_string(&format!("{{{{{}}}}}", e)).unwrap_or_default()
+                }).to_string();
+            }
+            self.save_vars(source, &vars);
+        }
+        Ok(Fetcher::prepare_url(&raw, key, Some(page)))
     }
 
     /// 搜索（单源）
@@ -192,28 +218,22 @@ impl BookService {
         Ok(books)
     }
 
-    fn parse_book_item(&self, source: &BookSource, ctx: &mut RuleContext, el: &String, base_url: &str, rule: &crate::model::BookListRule) -> AppResult<Option<Book>> {
+    fn parse_book_item(&self, source: &BookSource, ctx: &mut RuleContext, el: &crate::engine::value::Val, base_url: &str, rule: &crate::model::BookListRule) -> AppResult<Option<Book>> {
         // 把单个元素作为上下文内容
-        let html = el.clone();
-        let mut item_ctx = RuleContext::new(html, base_url.to_string());
-        item_ctx.js_lib = ctx.js_lib.clone();
-        item_ctx.variables = ctx.variables.clone();
-        item_ctx.fetch = ctx.fetch.clone();
+        let mut item_ctx = ctx.with_content(el.clone());
 
         let name = get_s(&mut item_ctx, rule.name.as_deref())?;
         if name.is_empty() { return Ok(None); }
 
-        let book_url_raw = get_s(&mut item_ctx, rule.book_url.as_deref())?;
-        let book_url = absolute_url(base_url, &book_url_raw);
+        let book_url = get_s_url(&mut item_ctx, rule.book_url.as_deref())?;
 
         let author = get_s(&mut item_ctx, rule.author.as_deref())?;
         let kind = get_list(&mut item_ctx, rule.kind.as_deref())?.join(",");
         let word_count = get_s(&mut item_ctx, rule.word_count.as_deref())?;
         let last_chapter = get_s(&mut item_ctx, rule.last_chapter.as_deref())?;
-        let cover_url = absolute_url(base_url, &get_s(&mut item_ctx, rule.cover_url.as_deref())?);
+        let cover_url = get_s_url(&mut item_ctx, rule.cover_url.as_deref())?;
         let intro = get_s(&mut item_ctx, rule.intro.as_deref())?;
 
-        ctx.variables = item_ctx.variables.clone();
         Ok(Some(Book {
             book_url, origin: source.book_source_url.clone(),
             origin_name: source.book_source_name.clone(), name, author, kind,
@@ -372,18 +392,30 @@ impl BookService {
         let mut chapters = Vec::new();
         for el in &elements {
             // 每个元素用独立上下文求值，规则才能完整支持 && / || / ## / {{js}} 等
-            let mut item = RuleContext::new(el.clone(), page_url.to_string());
-            item.js_lib = ctx.js_lib.clone();
-            item.variables = ctx.variables.clone();
-            item.fetch = ctx.fetch.clone();
-            item.cookies = ctx.cookies.clone();
+            let mut item = ctx.with_content(el.clone());
             let title = get_s(&mut item, Some(name_rule))?;
             if title.is_empty() { continue; }
             let raw_url = get_s(&mut item, Some(url_rule))?;
             let chapter_url = if raw_url.is_empty() { page_url.to_string() } else { absolute_url(page_url, &raw_url) };
+            let flag = |item: &mut RuleContext, r: &Option<String>| -> bool {
+                match r.as_deref().filter(|s| !s.is_empty()) {
+                    Some(r) => item.get_string(r).map(|v| crate::engine::util::is_true(&v, false)).unwrap_or(false),
+                    None => false,
+                }
+            };
+            let is_volume = flag(&mut item, &rule.is_volume);
+            let is_vip = flag(&mut item, &rule.is_vip) || flag(&mut item, &rule.is_pay);
+            let mut title = title;
+            if let Some(js) = rule.format_js.as_deref().filter(|s| !s.is_empty()) {
+                let script = format!("var index={};var title={};\n{}", chapters.len() + 1,
+                    serde_json::to_string(&title).unwrap_or_default(), js);
+                if let Ok(v) = item.eval_js(&script, &crate::engine::value::Val::Str(title.clone())) {
+                    let t = v.to_text(); if !t.is_empty() { title = t; }
+                }
+            }
             chapters.push(BookChapter {
                 index: 0, title, url: chapter_url,
-                is_volume: false, is_vip: false,
+                is_volume, is_vip,
             });
         }
         Ok((chapters, nexts))
@@ -449,8 +481,9 @@ impl BookService {
         // 全文替换：把 replaceRegex（形如 `##正则##替换`）作用在拼好的正文上
         if let Some(replace) = rule.replace_regex.as_deref().filter(|s| !s.is_empty()) {
             let mut sub = self.make_context(text.clone(), final_url.clone(), source, &vars);
-            if let Ok(r) = sub.get_string(replace) { text = r; }
+            if let Ok(r) = sub.get_string_raw(replace) { text = r; }
         }
+        if text.trim().is_empty() { return Err(AppError::internal("正文为空")); }
         self.save_vars(source, &vars);
         Ok(text)
     }
@@ -461,8 +494,9 @@ impl BookService {
         chapter: &BookChapter, body: String, page_url: &str, get_next: bool,
     ) -> AppResult<(String, Vec<String>)> {
         let mut ctx = self.make_context(body, page_url.to_string(), source, vars);
-        ctx.chapter_title = chapter.title.clone();
-        let text = ctx.get_string(rule.content.as_deref().unwrap_or(""))?;
+        ctx.set_chapter_title(&chapter.title);
+        let text = ctx.get_string_raw(rule.content.as_deref().unwrap_or(""))?;
+        let text = crate::engine::htmlfmt::format_keep_img(&text, Some(page_url));
         let mut nexts: Vec<String> = Vec::new();
         if get_next {
             if let Some(r) = rule.next_content_url.as_deref().filter(|s| !s.is_empty()) {
@@ -489,6 +523,9 @@ const PAGE_CONCURRENCY: usize = 6;
 
 fn get_s(ctx: &mut RuleContext, rule: Option<&str>) -> AppResult<String> {
     match rule { Some(r) if !r.is_empty() => ctx.get_string(r), _ => Ok(String::new()) }
+}
+fn get_s_url(ctx: &mut RuleContext, rule: Option<&str>) -> AppResult<String> {
+    match rule { Some(r) if !r.is_empty() => ctx.get_string_url(r), _ => Ok(String::new()) }
 }
 fn get_list(ctx: &mut RuleContext, rule: Option<&str>) -> AppResult<Vec<String>> {
     match rule { Some(r) if !r.is_empty() => ctx.get_string_list(r), _ => Ok(vec![]) }
@@ -623,10 +660,10 @@ mod pagination_tests {
         let ch = BookChapter { url: format!("http://127.0.0.1:{}/c/1", port), ..Default::default() };
         let next_ch = format!("http://127.0.0.1:{}/c/2", port);
         let text = svc.content_with_next(&src, &book, &ch, Some(&next_ch)).await.unwrap();
-        assert_eq!(text, "第一页内容\n第二页内容");
+        assert!(text.contains("第一页内容") && text.contains("第二页内容") && !text.contains("下一章内容"), "{:?}", text);
         // 不知道下一章时，会把“下一章”也并进来（与官方一致，所以 API/下载器要传 next_url）
         let text2 = svc.content_with_next(&src, &book, &ch, None).await.unwrap();
-        assert_eq!(text2, "第一页内容\n第二页内容\n下一章内容");
+        assert!(text2.contains("下一章内容"), "{:?}", text2);
     }
 
     /// 回归：@js: 正文规则里含 $N 引用与 {} 代码块时，

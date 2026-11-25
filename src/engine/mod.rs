@@ -5,6 +5,9 @@ pub mod htmlfmt;
 pub mod js;
 pub mod jsoup;
 pub mod selector;
+pub mod util;
+pub mod jsonpath;
+pub mod rule_analyzer;
 pub mod value;
 pub mod xpath;
 

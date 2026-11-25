@@ -6,6 +6,7 @@
 
 use crate::cookie::CookieStore;
 use crate::error::{AppError, AppResult};
+use crate::engine::value::Val;
 use crate::fetcher::FetchResponse;
 use rquickjs::{Context, Function, Object, Runtime, Value};
 use std::collections::HashMap;
@@ -47,6 +48,44 @@ pub struct JsContext {
     pub cookies: CookieStore,
     /// 登录信息（getLoginInfoMap 返回）
     pub login_info: VarStore,
+    /// 非字符串的 `result`（JSON 对象/数组），有值时 `result` 绑定为解析后的对象
+    pub result_json: Option<String>,
+    /// 书/章节级变量（`java.put` 优先写章节，其次书，最后书源）
+    pub book_vars: Option<VarStore>,
+    pub chapter_vars: Option<VarStore>,
+    /// 规则 `src`（当前内容）、下一章链接
+    pub src: String,
+    pub next_chapter_url: String,
+    pub book: Option<JsBook>,
+    pub chapter: Option<JsChapter>,
+    /// 规则引擎回调（`java.getString/getElements/setContent` 等）
+    pub host: Option<Arc<Mutex<crate::engine::context::RuleContext>>>,
+}
+
+/// `book` 绑定（对应官方 Book 实体里脚本常用的字段）
+#[derive(Clone, Default, Debug)]
+pub struct JsBook {
+    pub name: String,
+    pub author: String,
+    pub book_url: String,
+    pub toc_url: String,
+    pub origin: String,
+    pub origin_name: String,
+    pub kind: String,
+    pub intro: String,
+    pub cover_url: String,
+    pub latest_chapter_title: String,
+    pub word_count: String,
+}
+
+/// `chapter` 绑定
+#[derive(Clone, Default, Debug)]
+pub struct JsChapter {
+    pub title: String,
+    pub url: String,
+    pub index: i32,
+    pub is_volume: bool,
+    pub base_url: String,
 }
 
 impl Default for JsContext {
@@ -56,7 +95,8 @@ impl Default for JsContext {
             source_url: String::new(), source_name: String::new(), book_name: String::new(),
             chapter_title: String::new(), variables: new_var_store(), fetch: None,
             webview: None, key: String::new(), page: 1, cookies: CookieStore::new(),
-            login_info: new_var_store(),
+            login_info: new_var_store(), result_json: None, book_vars: None, chapter_vars: None,
+            src: String::new(), next_chapter_url: String::new(), book: None, chapter: None, host: None,
         }
     }
 }
@@ -81,14 +121,17 @@ pub fn eval(expr: &str, ctx: &JsContext) -> AppResult<String> {
     eval_inner(expr, ctx, true)
 }
 
-/// 规则求值：表达式包进 IIFE，兼容 @js: 复杂的 replace/正则链（返回表达式结果）
-fn eval_inner(expr: &str, ctx: &JsContext, script_mode: bool) -> AppResult<String> {
+/// 把脚本结果统一成带类型标记的字符串：N=空 S=文本 J=JSON（对象/数组）
+const RESULT_TAGGER: &str = "(function(r){ if(r===null||r===undefined) return 'N'; var t=typeof r; \
+ if(t==='object'||t==='function'){ try{ var j=JSON.stringify(r); if(j===undefined) return 'S'+String(r); return 'J'+j; }catch(e){ return 'S'+String(r); } } \
+ return 'S'+String(r); })";
+
+fn eval_tagged(expr: &str, ctx: &JsContext, script_mode: bool) -> AppResult<String> {
     let runtime = Runtime::new().map_err(|e| AppError::internal(format!("QuickJS runtime: {e}")))?;
     let context = Context::full(&runtime).map_err(|e| AppError::internal(format!("QuickJS context: {e}")))?;
 
     context.with(|js| {
-        // 内置官方 CryptoJS（对齐 Legado）：每次新建 Runtime 后注入一次全局 CryptoJS。
-        // 仅当脚本/jsLib 实际引用 CryptoJS 时才 eval，避免无谓开销。
+        // 内置官方 CryptoJS（对齐 Legado）：仅当脚本/jsLib 实际引用时才注入
         let uses_crypto = expr.contains("CryptoJS") || ctx.js_lib.contains("CryptoJS");
         if uses_crypto {
             let _: Result<Value, _> = js.eval(CRYPTO_JS_SOURCE);
@@ -96,9 +139,9 @@ fn eval_inner(expr: &str, ctx: &JsContext, script_mode: bool) -> AppResult<Strin
         inject_bindings(&js, ctx)?;
         let script = if script_mode {
             let expr_json = serde_json::to_string(expr).unwrap_or_else(|_| "\"\"".into());
-            format!("{}\n;var __reader_result = eval({});\n__reader_result;", ctx.js_lib, expr_json)
+            format!("{}\n;var __reader_result = eval({});\n{}(__reader_result);", ctx.js_lib, expr_json, RESULT_TAGGER)
         } else {
-            format!("{}\n;var __reader_result = (function(){{ return ({}); }})();\n__reader_result;", ctx.js_lib, expr)
+            format!("{}\n;var __reader_result = (function(){{ return ({}); }})();\n{}(__reader_result);", ctx.js_lib, expr, RESULT_TAGGER)
         };
         let val: Value = js.eval(script).map_err(|e| {
             let detail = catch_js_error(&js);
@@ -106,6 +149,27 @@ fn eval_inner(expr: &str, ctx: &JsContext, script_mode: bool) -> AppResult<Strin
         })?;
         Ok(js_value_to_string(&val))
     })
+}
+
+fn decode_tagged(t: &str) -> Val {
+    let mut it = t.chars();
+    match it.next() {
+        Some('S') => Val::Str(it.as_str().to_string()),
+        Some('J') => match serde_json::from_str::<serde_json::Value>(it.as_str()) {
+            Ok(v) => Val::from_json(v),
+            Err(_) => Val::Str(it.as_str().to_string()),
+        },
+        _ => Val::Null,
+    }
+}
+
+/// 执行脚本并保留结果类型（字符串 / JSON 对象 / 数组 / 空），对应官方 `evalJS` 返回的 `Any?`
+pub fn eval_val(expr: &str, ctx: &JsContext) -> AppResult<Val> {
+    Ok(decode_tagged(&eval_tagged(expr, ctx, true)?))
+}
+
+fn eval_inner(expr: &str, ctx: &JsContext, script_mode: bool) -> AppResult<String> {
+    Ok(decode_tagged(&eval_tagged(expr, ctx, script_mode)?).to_text())
 }
 
 /// 执行 JS 语句并返回结果（用于 @js: 含多条语句的场景）
@@ -464,6 +528,11 @@ fn vars_json(store: &VarStore) -> String {
 fn inject_bindings(js: &rquickjs::Ctx<'_>, jc: &JsContext) -> AppResult<()> {
     use crate::engine::crypto as c;
     js.globals().set("result", jc.result.clone()).ok();
+    if let Some(rj) = &jc.result_json {
+        let _: Result<Value, _> = js.eval(format!("var result = {};", rj));
+    }
+    js.globals().set("src", jc.src.clone()).ok();
+    js.globals().set("nextChapterUrl", jc.next_chapter_url.clone()).ok();
     js.globals().set("baseUrl", jc.base_url.clone()).ok();
     js.globals().set("bookName", jc.book_name.clone()).ok();
     js.globals().set("title", jc.chapter_title.clone()).ok();
@@ -727,44 +796,199 @@ fn inject_bindings(js: &rquickjs::Ctx<'_>, jc: &JsContext) -> AppResult<()> {
     }).ok();
     if let Some(f) = cf_fn { java.set("__cacheFile", f).ok(); }
 
-    // java.put / java.get —— 写入共享变量表（Rust 闭包，真正回传给规则层与落库）
-    let put_store = jc.variables.clone();
+    // java.put / java.get —— 对齐 AnalyzeRule：章节 → 书 → 书源 三层变量
+    let put_stores = (jc.chapter_vars.clone(), jc.book_vars.clone(), jc.variables.clone());
     let put_fn = Function::new(js.clone(), move |k: String, v: Value| -> String {
         let s = js_value_to_string(&v);
-        if let Ok(mut m) = put_store.lock() { m.insert(k, s.clone()); }
+        let store = put_stores.0.as_ref().or(put_stores.1.as_ref()).unwrap_or(&put_stores.2);
+        if let Ok(mut m) = store.lock() { m.insert(k, s.clone()); }
         s
     }).ok();
     if let Some(f) = put_fn { java.set("put", f).ok(); }
-    let get_store = jc.variables.clone();
+    let get_stores = (jc.chapter_vars.clone(), jc.book_vars.clone(), jc.variables.clone());
+    let get_book = jc.book_name.clone();
+    let get_title = jc.chapter_title.clone();
     let get_fn = Function::new(js.clone(), move |k: String| -> String {
-        get_store.lock().ok().and_then(|m| m.get(&k).cloned()).unwrap_or_default()
+        if k == "bookName" && !get_book.is_empty() { return get_book.clone(); }
+        if k == "title" && !get_title.is_empty() { return get_title.clone(); }
+        for st in [get_stores.0.as_ref(), get_stores.1.as_ref(), Some(&get_stores.2)].into_iter().flatten() {
+            if let Some(v) = st.lock().ok().and_then(|m| m.get(&k).cloned()).filter(|v| !v.is_empty()) { return v; }
+        }
+        String::new()
     }).ok();
     if let Some(f) = get_fn { java.set("get", f).ok(); }
+
+    // 规则引擎回调：java.getString / getStringList / getElement(s) / setContent
+    if let Some(host) = &jc.host {
+        let h = host.clone();
+        let f = Function::new(js.clone(), move |rule: String, unescape: bool| -> String {
+            let Ok(mut g) = h.lock() else { return String::new() };
+            if unescape { g.get_string(&rule).unwrap_or_default() } else { g.get_string_raw(&rule).unwrap_or_default() }
+        }).ok();
+        if let Some(f) = f { java.set("__getString", f).ok(); }
+        let h = host.clone();
+        let f = Function::new(js.clone(), move |rule: String| -> String {
+            let Ok(mut g) = h.lock() else { return "[]".into() };
+            serde_json::to_string(&g.get_string_list(&rule).unwrap_or_default()).unwrap_or_else(|_| "[]".into())
+        }).ok();
+        if let Some(f) = f { java.set("__getStringList", f).ok(); }
+        let h = host.clone();
+        let f = Function::new(js.clone(), move |rule: String| -> String {
+            let Ok(mut g) = h.lock() else { return "[]".into() };
+            let items: Vec<serde_json::Value> = g.get_elements(&rule).unwrap_or_default().iter().map(|v| v.to_json()).collect();
+            serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
+        }).ok();
+        if let Some(f) = f { java.set("__getElements", f).ok(); }
+        let h = host.clone();
+        let f = Function::new(js.clone(), move |rule: String| -> String {
+            let Ok(mut g) = h.lock() else { return "null".into() };
+            g.get_element(&rule).map(|v| v.to_json().to_string()).unwrap_or_else(|_| "null".into())
+        }).ok();
+        if let Some(f) = f { java.set("__getElement", f).ok(); }
+        let h = host.clone();
+        let f = Function::new(js.clone(), move |content_json: String, base: String| {
+            let Ok(mut g) = h.lock() else { return };
+            let v = serde_json::from_str::<serde_json::Value>(&content_json).unwrap_or(serde_json::Value::Null);
+            g.set_content(Val::from_json(v));
+            if !base.is_empty() { g.base_url = base.clone(); g.set_redirect_url(&base); }
+        }).ok();
+        if let Some(f) = f { java.set("__setContent", f).ok(); }
+    }
 
     // 加密扩展：对齐 Legado JsEncodeUtils（摘要 / HMac / AES）
     inject_crypto_bindings(js, &java);
 
-    js.globals().set("java", java).ok();
+    js.globals().set("java", java.clone()).ok();
 
     // jsUrl 变量：key / page
     js.globals().set("key", jc.key.clone()).ok();
     js.globals().set("page", jc.page).ok();
 
     // JSON 规则中的内联 {{$.field}}：注入 $ = JSON.parse(result)
-    let dollar_bootstrap = format!(
-        "var $ = (function(){{ try{{ return JSON.parse({}); }}catch(e){{ return {{}}; }} }})();",
-        serde_json::to_string(&jc.result).unwrap_or_else(|_| "\"\"".into())
-    );
+    let dollar_bootstrap = if jc.result_json.is_some() {
+        "var $ = result;".to_string()
+    } else {
+        format!(
+            "var $ = (function(){{ try{{ return JSON.parse({}); }}catch(e){{ return {{}}; }} }})();",
+            serde_json::to_string(&jc.result).unwrap_or_else(|_| "\"\"".into())
+        )
+    };
     let _: Result<Value, _> = js.eval(dollar_bootstrap);
 
-    // cookie 占位对象（真实 cookie 走 java.getCookie）；cache 在 bootstrap 中挂载为真实实现
-    let cookie_obj = Object::new(js.clone()).ok();
-    if let Some(o) = cookie_obj {
-        js.globals().set("cookie", o).ok();
-    }
+    // cookie 对象：getCookie / getKey / setCookie / removeCookie（共享 Cookie jar）
+    let ck = jc.cookies.clone();
+    let f = Function::new(js.clone(), move |url: String, c: String| {
+        let mut h = reqwest::header::HeaderMap::new();
+        for pair in c.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() || !pair.contains('=') { continue; }
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(pair) {
+                h.append(reqwest::header::SET_COOKIE, v);
+            }
+        }
+        ck.store_response(&url, &h);
+    }).ok();
+    if let Some(f) = f { java.set("__setCookie", f).ok(); }
+    let ck = jc.cookies.clone();
+    let f = Function::new(js.clone(), move |url: String| {
+        let mut h = reqwest::header::HeaderMap::new();
+        for pair in ck.get_by_tag(&url).split(';') {
+            let name = pair.trim().split('=').next().unwrap_or("").trim();
+            if name.is_empty() { continue; }
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("{}=; Max-Age=0", name)) {
+                h.append(reqwest::header::SET_COOKIE, v);
+            }
+        }
+        ck.store_response(&url, &h);
+    }).ok();
+    if let Some(f) = f { java.set("__removeCookie", f).ok(); }
+
+    // book / chapter 对象的变量读写（书 → 书源；章节 → 书 → 书源）
+    let bv = jc.book_vars.clone().unwrap_or_else(|| jc.variables.clone());
+    let f = Function::new(js.clone(), {
+        let bv = bv.clone();
+        move |k: String, v: Value| -> String {
+            let s = js_value_to_string(&v);
+            if let Ok(mut m) = bv.lock() { m.insert(k, s.clone()); }
+            s
+        }
+    }).ok();
+    if let Some(f) = f { java.set("__bookPut", f).ok(); }
+    let f = Function::new(js.clone(), move |k: String| -> String {
+        bv.lock().ok().and_then(|m| m.get(&k).cloned()).unwrap_or_default()
+    }).ok();
+    if let Some(f) = f { java.set("__bookGet", f).ok(); }
+    let cv = jc.chapter_vars.clone().or(jc.book_vars.clone()).unwrap_or_else(|| jc.variables.clone());
+    let f = Function::new(js.clone(), {
+        let cv = cv.clone();
+        move |k: String, v: Value| -> String {
+            let s = js_value_to_string(&v);
+            if let Ok(mut m) = cv.lock() { m.insert(k, s.clone()); }
+            s
+        }
+    }).ok();
+    if let Some(f) = f { java.set("__chapterPut", f).ok(); }
+    let f = Function::new(js.clone(), move |k: String| -> String {
+        cv.lock().ok().and_then(|m| m.get(&k).cloned()).unwrap_or_default()
+    }).ok();
+    if let Some(f) = f { java.set("__chapterGet", f).ok(); }
 
     // 高级 API 组装：Response 对象 / ajax 家族 / createSymmetricCrypto / 字节转换 / cache
     let _: Result<Value, _> = js.eval(BOOTSTRAP_JS);
+    let book_json = jc.book.as_ref().map(|b| serde_json::json!({
+        "name": b.name, "author": b.author, "bookUrl": b.book_url, "tocUrl": b.toc_url,
+        "origin": b.origin, "originName": b.origin_name, "kind": b.kind, "intro": b.intro,
+        "coverUrl": b.cover_url, "latestChapterTitle": b.latest_chapter_title, "wordCount": b.word_count,
+    }).to_string()).unwrap_or_else(|| "null".into());
+    let chapter_json = jc.chapter.as_ref().map(|c| serde_json::json!({
+        "title": c.title, "url": c.url, "index": c.index, "isVolume": c.is_volume, "baseUrl": c.base_url,
+    }).to_string()).unwrap_or_else(|| "null".into());
+    let host_js = format!(r#"(function(){{
+    var g = (typeof globalThis !== 'undefined') ? globalThis : this;
+    function accessors(o) {{
+        Object.keys(o).forEach(function(k) {{
+            var n = 'get' + k.charAt(0).toUpperCase() + k.slice(1);
+            if (!(n in o)) {{ Object.defineProperty(o, n, {{ value: function() {{ return o[k]; }}, enumerable: false }}); }}
+        }});
+        return o;
+    }}
+    var b = {book};
+    if (b) {{
+        accessors(b);
+        Object.defineProperty(b, 'putVariable', {{ value: function(k, v) {{ return java.__bookPut(String(k), v); }}, enumerable: false }});
+        Object.defineProperty(b, 'getVariable', {{ value: function(k) {{ return java.__bookGet(String(k)); }}, enumerable: false }});
+        g.book = b;
+    }}
+    var c = {chapter};
+    if (c) {{
+        accessors(c);
+        Object.defineProperty(c, 'putVariable', {{ value: function(k, v) {{ return java.__chapterPut(String(k), v); }}, enumerable: false }});
+        Object.defineProperty(c, 'getVariable', {{ value: function(k) {{ return java.__chapterGet(String(k)); }}, enumerable: false }});
+        g.chapter = c;
+    }}
+    if (typeof cookie === 'undefined' || !cookie) {{ g.cookie = {{}}; }}
+    cookie.getCookie = function(url) {{ return java.getCookie(url); }};
+    cookie.getKey = function(url, key) {{ return java.getCookie(url, key); }};
+    cookie.setCookie = function(url, c) {{ java.__setCookie(String(url), String(c)); }};
+    cookie.removeCookie = function(url) {{ java.__removeCookie(String(url)); }};
+    if (typeof java.__getString === 'function') {{
+        java.getString = function(r, u) {{ return java.__getString(String(r), u === undefined ? true : !!u); }};
+        java.getStringList = function(r) {{ return JSON.parse(java.__getStringList(String(r))); }};
+        function listApi(a) {{
+            Object.defineProperty(a, 'size', {{ value: function() {{ return a.length; }}, enumerable: false }});
+            Object.defineProperty(a, 'get', {{ value: function(i) {{ return a[i]; }}, enumerable: false }});
+            return a;
+        }}
+        java.getElements = function(r) {{ return listApi(JSON.parse(java.__getElements(String(r)))); }};
+        java.getElement = function(r) {{ return JSON.parse(java.__getElement(String(r))); }};
+        java.setContent = function(c, base) {{ java.__setContent(JSON.stringify(c === undefined ? null : c), base ? String(base) : ''); return java; }};
+    }}
+    java.setRedirectUrl = java.setRedirectUrl || function(u) {{ return java; }};
+    java.toURL = java.toURL || function(u, base) {{
+        try {{ return new URL(u, base).href; }} catch (e) {{ return String(u); }}
+    }};
+}})();"#, book = book_json, chapter = chapter_json);
+    let _: Result<Value, _> = js.eval(host_js);
 
     // source 对象：getVariable / setVariable / getLoginInfoMap / 书源信息
     let source = Object::new(js.clone()).ok();

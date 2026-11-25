@@ -137,3 +137,59 @@ pub fn chained_attr_or_text(html: &str, rule: &str) -> Vec<String> {
     }
     out
 }
+
+// ───────────────────────── 规则管线值 ─────────────────────────
+
+/// 规则管线里流转的值，对应官方 AnalyzeRule 里的 `Any?`：
+/// 字符串（HTML/JSON 文本/结果文本）、JSON 对象（JSONPath 列表项 / JS 对象）、列表。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Val {
+    Null,
+    Str(String),
+    Json(Value),
+    List(Vec<Val>),
+}
+
+impl Val {
+    pub fn from_json(v: Value) -> Val {
+        match v {
+            Value::Null => Val::Null,
+            Value::String(s) => Val::Str(s),
+            Value::Array(a) => Val::List(a.into_iter().map(Val::from_json).collect()),
+            Value::Object(_) => Val::Json(v),
+            other => Val::Str(other.to_string()),
+        }
+    }
+
+    /// 对应 Kotlin `toString()`：列表按行拼接（与官方 getString 对列表结果的处理一致）
+    pub fn to_text(&self) -> String {
+        match self {
+            Val::Null => String::new(),
+            Val::Str(s) => s.clone(),
+            Val::Json(Value::String(s)) => s.clone(),
+            Val::Json(v) => v.to_string(),
+            Val::List(l) => l.iter().map(|v| v.to_text()).collect::<Vec<_>>().join("\n"),
+        }
+    }
+
+    pub fn is_null(&self) -> bool { matches!(self, Val::Null) }
+
+    /// 作为 JSON 值交给 JS（`result` 绑定）
+    pub fn to_json(&self) -> Value {
+        match self {
+            Val::Null => Value::Null,
+            Val::Str(s) => Value::String(s.clone()),
+            Val::Json(v) => v.clone(),
+            Val::List(l) => Value::Array(l.iter().map(|v| v.to_json()).collect()),
+        }
+    }
+
+    /// 内容是不是 JSON（对应 `content.toString().isJson()`）
+    pub fn looks_like_json(&self) -> bool {
+        match self {
+            Val::Json(Value::Object(_)) | Val::Json(Value::Array(_)) => true,
+            Val::Str(s) => crate::engine::util::is_json(s),
+            _ => false,
+        }
+    }
+}

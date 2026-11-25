@@ -18,6 +18,7 @@
 //! 元素在引擎里以 outerHTML 字符串传递，所以这里每次调用先把输入解析成一棵树，
 //! 在同一棵树上完成整条链，最后把结果转回字符串。
 
+use crate::engine::rule_analyzer::RuleAnalyzer;
 use ego_tree::NodeId;
 use regex::Regex;
 use scraper::{ElementRef, Html, Node, Selector};
@@ -529,8 +530,8 @@ fn result_last(doc: &Doc, elements: &[NodeId], last_rule: &str) -> Vec<String> {
 
 // ───────────────────────── 对外接口 ─────────────────────────
 
-/// 对应 `AnalyzeByJSoup.getElements`（单条规则，不含 `&&`/`||`/`%%`）：返回元素的 outerHTML
-pub fn elements(src: &str, rule: &str) -> Vec<String> {
+/// 单条规则（不含 `&&`/`||`/`%%`）取元素，返回 outerHTML
+fn elements_plain(src: &str, rule: &str) -> Vec<String> {
     let rule = trim_rule(rule);
     if rule.is_empty() { return vec![]; }
     let doc = Doc::parse(src);
@@ -549,8 +550,8 @@ pub fn elements(src: &str, rule: &str) -> Vec<String> {
     current.into_iter().filter_map(|id| doc.el(id).map(|e| e.html())).collect()
 }
 
-/// 对应 `AnalyzeByJSoup.getResultList`（单条规则）：最后一步是输出修饰符
-pub fn result_list(src: &str, rule: &str) -> Vec<String> {
+/// 单条规则取内容：最后一步是输出修饰符
+fn result_list_plain(src: &str, rule: &str) -> Vec<String> {
     let rule = trim_rule(rule);
     if rule.is_empty() { return vec![]; }
     let doc = Doc::parse(src);
@@ -566,6 +567,89 @@ pub fn result_list(src: &str, rule: &str) -> Vec<String> {
     }
     if current.is_empty() { return vec![]; }
     result_last(&doc, &current, steps[last].trim())
+}
+
+// ───────────────────────── 完整入口（含 && || %% 与 @CSS:） ─────────────────────────
+
+/// 对应内部类 `SourceRule`：识别 `@CSS:` 前缀
+fn split_css_prefix(rule: &str) -> (bool, &str) {
+    if rule.len() >= 5 && rule.is_char_boundary(5) && rule[..5].eq_ignore_ascii_case("@CSS:") {
+        (true, rule[5..].trim())
+    } else {
+        (false, rule)
+    }
+}
+
+fn merge_groups<T: Clone>(groups: Vec<Vec<T>>, et: &str) -> Vec<T> {
+    let mut out = Vec::new();
+    if groups.is_empty() { return out; }
+    if et == "%%" {
+        for i in 0..groups[0].len() {
+            for g in &groups { if i < g.len() { out.push(g[i].clone()); } }
+        }
+    } else {
+        for g in groups { out.extend(g); }
+    }
+    out
+}
+
+/// 对应 `AnalyzeByJSoup.getElements`：返回元素 outerHTML 列表
+pub fn elements(src: &str, rule: &str) -> Vec<String> {
+    if rule.is_empty() { return vec![]; }
+    let (is_css, rules_str) = split_css_prefix(rule);
+    let (parts, et) = RuleAnalyzer::split_or_whole(rules_str, false, &["&&", "||", "%%"]);
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for part in &parts {
+        let els = if is_css {
+            let doc = Doc::parse(src);
+            css_in(&doc, doc.root, part).into_iter()
+                .filter_map(|id| doc.el(id).map(|e| e.html())).collect::<Vec<_>>()
+        } else {
+            elements_plain(src, part)
+        };
+        let non_empty = !els.is_empty();
+        groups.push(els);
+        if non_empty && et == "||" { break; }
+    }
+    merge_groups(groups, &et)
+}
+
+/// 对应 `AnalyzeByJSoup.getStringList`
+pub fn result_list(src: &str, rule: &str) -> Vec<String> {
+    if rule.is_empty() { return vec![]; }
+    let (is_css, rules_str) = split_css_prefix(rule);
+    if rules_str.is_empty() {
+        // 官方：elementsRule 为空时取根元素的 data()（脚本/样式内容），此处取文本兜底
+        let doc = Doc::parse(src);
+        return vec![full_text(&doc, doc.root)];
+    }
+    let (parts, et) = RuleAnalyzer::split_or_whole(rules_str, false, &["&&", "||", "%%"]);
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for part in &parts {
+        let temp = if is_css {
+            let (sel, last) = match part.rfind('@') {
+                Some(i) => (&part[..i], &part[i + 1..]),
+                None => (part.as_str(), "text"),
+            };
+            let doc = Doc::parse(src);
+            let ids = css_in(&doc, doc.root, sel);
+            result_last(&doc, &ids, last.trim())
+        } else {
+            result_list_plain(src, part)
+        };
+        if !temp.is_empty() {
+            groups.push(temp);
+            if et == "||" { break; }
+        }
+    }
+    merge_groups(groups, &et)
+}
+
+/// 对应 `AnalyzeByJSoup.getString`：多结果用 `\n` 连接
+pub fn result_string(src: &str, rule: &str) -> Option<String> {
+    if rule.is_empty() { return None; }
+    let list = result_list(src, rule);
+    if list.is_empty() { None } else { Some(list.join("\n")) }
 }
 
 #[cfg(test)]
