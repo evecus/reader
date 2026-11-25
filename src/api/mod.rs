@@ -20,6 +20,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sources/test", axum::routing::post(test_source))
         .route("/api/search", axum::routing::get(search))
         .route("/api/explore", axum::routing::get(explore))
+        .route("/api/explore/kinds", axum::routing::get(explore_kinds))
         .route("/api/book/info", axum::routing::get(book_info))
         .route("/api/book/chapters", axum::routing::get(chapters))
         .route("/api/book/content", axum::routing::get(content))
@@ -134,6 +135,20 @@ async fn search(State(s): State<Arc<AppState>>, Query(p): Query<SearchParams>) -
 }
 
 #[derive(Debug, Deserialize)]
+struct KindsParams { origin: String }
+
+/// 发现分类：支持 JSON 数组 / `标题::地址` 多行 / `<js>` `@js:` 脚本
+async fn explore_kinds(State(s): State<Arc<AppState>>, Query(p): Query<KindsParams>) -> AppResult<Json<Value>> {
+    let sources = s.db.list_sources(false)?;
+    let src = sources.iter().find(|x| x.book_source_url == p.origin)
+        .ok_or_else(|| AppError::not_found("书源不存在"))?.clone();
+    let books = s.books.clone();
+    let kinds = tokio::task::spawn_blocking(move || books.explore_kinds(&src)).await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!({ "kinds": kinds })))
+}
+
+#[derive(Debug, Deserialize)]
 struct ExploreParams { origin: String, url: String, #[serde(default = "default_page")] page: i32 }
 
 async fn explore(State(s): State<Arc<AppState>>, Query(p): Query<ExploreParams>) -> AppResult<Json<Value>> {
@@ -142,7 +157,7 @@ async fn explore(State(s): State<Arc<AppState>>, Query(p): Query<ExploreParams>)
         .ok_or_else(|| AppError::not_found("书源不存在"))?;
     // 解析 exploreUrl JSON 找到对应 title 的 url
     let target = if p.url.starts_with("http") { p.url.clone() } else {
-        let entries: Vec<ExploreEntry> = serde_json::from_str(src.explore_url.as_deref().unwrap_or("[]")).unwrap_or_default();
+        let entries = s.books.explore_kinds(src);
         entries.iter().find(|e| e.title == p.url).map(|e| e.url.clone()).unwrap_or(p.url.clone())
     };
     let books = s.books.explore(src, &target, p.page).await?;

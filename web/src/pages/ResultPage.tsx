@@ -27,13 +27,7 @@ export default function ResultPage({ explore = false }: { explore?: boolean }) {
     api.listSources().then(srcs => {
       const src = srcs.find(s => s.enabled) || srcs[0]
       if (!src) { setNoSource(true); setLoading(false); return }
-      let firstUrl = ''
-      try {
-        const entries: ExploreEntry[] = JSON.parse(src.exploreUrl || '[]')
-        firstUrl = entries.find(e => e.url)?.url || ''
-      } catch { /* ignore */ }
       const q = new URLSearchParams({ origin: src.bookSourceUrl })
-      if (firstUrl) q.set('url', firstUrl)
       navigate(`/explore?${q}`, { replace: true })
     }).catch(e => { toast(e.message); setLoading(false) })
   }, [explore, origin])
@@ -41,19 +35,13 @@ export default function ResultPage({ explore = false }: { explore?: boolean }) {
   // 加载书源的发现分类，未指定分类时默认选中第一个有效分类
   useEffect(() => {
     if (!explore || !origin) return
-    api.listSources().then(srcs => {
-      const src = srcs.find(s => s.bookSourceUrl === origin)
-      if (src?.exploreUrl) {
-        try {
-          const entries: ExploreEntry[] = JSON.parse(src.exploreUrl as string)
-          setExploreEntries(entries)
-          if (!activeEntry) {
-            const first = entries.find(e => e.url)
-            if (first) setActiveEntry(first.url)
-          }
-        } catch { /* ignore */ }
+    api.exploreKinds(origin).then(({ kinds }) => {
+      setExploreEntries(kinds)
+      if (!activeEntry) {
+        const first = kinds.find(e => e.url)
+        if (first) setActiveEntry(first.url)
       }
-    }).catch(() => {})
+    }).catch(e => toast(e.message))
   }, [explore, origin])
 
   const load = () => {

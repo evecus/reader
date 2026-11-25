@@ -1,4 +1,4 @@
-import type { Book, BookChapter, BookSource, CacheBook, CacheItem, ShelfItem, DownloadTask } from './types'
+import type { Book, BookChapter, BookSource, CacheBook, CacheItem, ShelfItem, DownloadTask, ExploreEntry } from './types'
 
 async function req<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(path, options)
@@ -39,6 +39,8 @@ export const api = {
     if (origin) q.set('origin', origin)
     return req<{ books: Book[]; errors: { source: string; error: string }[] }>(`/api/search?${q}`)
   },
+  exploreKinds: (origin: string) =>
+    req<{ kinds: ExploreEntry[] }>(`/api/explore/kinds?${new URLSearchParams({ origin })}`),
   explore: (origin: string, url: string, page = 1) =>
     req<{ books: Book[]; errors?: { source: string; error: string }[] }>(`/api/explore?${new URLSearchParams({ origin, url, page: String(page) })}`),
 

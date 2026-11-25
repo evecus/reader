@@ -52,6 +52,38 @@ impl BookService {
         let _ = self.db.set_source_variables(&source.book_source_url, &Value::Object(map));
     }
 
+    /// 加载书/章节级变量（scope_key：`book:<url>` / `chapter:<book>|<chapter>`）
+    fn load_scope(&self, source: &BookSource, scope_key: &str) -> VarStore {
+        let store = new_var_store();
+        if let Ok(Value::Object(map)) = self.db.get_rule_vars(&source.book_source_url, scope_key) {
+            if let Ok(mut m) = store.lock() {
+                for (k, v) in map {
+                    m.insert(k, match v { Value::String(s) => s, o => o.to_string() });
+                }
+            }
+        }
+        store
+    }
+
+    /// 回写；为空且库里本来没有则不写，避免大目录产生无用行
+    fn save_scope(&self, source: &BookSource, scope_key: &str, store: &VarStore) {
+        let map = match store.lock() {
+            Ok(m) if !m.is_empty() => m.iter().map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect::<serde_json::Map<String, Value>>(),
+            _ => return,
+        };
+        let _ = self.db.set_rule_vars(&source.book_source_url, scope_key, &Value::Object(map));
+    }
+
+    fn js_book(book: &Book) -> crate::engine::js::JsBook {
+        crate::engine::js::JsBook {
+            name: book.name.clone(), author: book.author.clone(), book_url: book.book_url.clone(),
+            toc_url: book.toc_url.clone(), origin: book.origin.clone(), origin_name: book.origin_name.clone(),
+            kind: book.kind.clone(), intro: book.intro.clone(), cover_url: book.cover_url.clone(),
+            latest_chapter_title: book.last_chapter.clone(), word_count: book.word_count.clone(),
+        }
+    }
+
     /// 构造 fetch 闭包：走实例方法以共享 Cookie jar
     fn fetch_closure(&self, source: &BookSource)
         -> std::sync::Arc<dyn Fn(&str, &str, u64) -> Result<FetchResponse, String> + Send + Sync>
@@ -147,6 +179,45 @@ impl BookService {
         Ok(Fetcher::prepare_url(&raw, key, Some(page)))
     }
 
+    /// 解析 exploreUrl（对齐官方 `BookSource.exploreKinds`）：
+    /// `<js>…</js>` / `@js:` 脚本先求值；结果为 JSON 数组或 `标题::地址` 多行（以 `&&` 或换行分隔）。
+    pub fn explore_kinds(&self, source: &BookSource) -> Vec<crate::model::ExploreEntry> {
+        let raw = source.explore_url.clone().unwrap_or_default();
+        let mut text = raw.trim().to_string();
+        if text.is_empty() { return vec![]; }
+        let lower = text.to_ascii_lowercase();
+        if lower.starts_with("<js>") || lower.starts_with("@js:") {
+            let script = if lower.starts_with("<js>") {
+                let body = &text[4..];
+                match body.to_ascii_lowercase().rfind("</js>") { Some(i) => body[..i].to_string(), None => body.to_string() }
+            } else { text[4..].to_string() };
+            let vars = self.load_vars(source);
+            let mut ctx = self.make_context(String::new(), source.book_source_url.clone(), source, &vars);
+            ctx.source_url = source.book_source_url.clone();
+            ctx.source_name = source.book_source_name.clone();
+            match ctx.eval_js(&script, &crate::engine::value::Val::Str(String::new())) {
+                Ok(v) => { text = v.to_text().trim().to_string(); self.save_vars(source, &vars); }
+                Err(e) => {
+                    return vec![crate::model::ExploreEntry { title: format!("ERROR:{}", e.message), url: e.message, ..Default::default() }];
+                }
+            }
+        }
+        if text.is_empty() { return vec![]; }
+        if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&text) {
+            return arr.into_iter().filter_map(|v| serde_json::from_value::<crate::model::ExploreEntry>(v).ok())
+                .filter(|e| !e.title.is_empty()).collect();
+        }
+        let Ok(sep) = regex::Regex::new(r"(&&|\n)+") else { return vec![] };
+        sep.split(&text).filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() { return None; }
+            let mut it = line.splitn(2, "::");
+            let title = it.next().unwrap_or("").trim().to_string();
+            let url = it.next().unwrap_or("").trim().to_string();
+            if title.is_empty() { None } else { Some(crate::model::ExploreEntry { title, url, ..Default::default() }) }
+        }).collect()
+    }
+
     /// 搜索（单源）
     pub async fn search(&self, source: &BookSource, key: &str, page: i32) -> AppResult<Vec<Book>> {
         let search_url = source.search_url.as_ref()
@@ -210,7 +281,7 @@ impl BookService {
 
         // 如果列表为空且是搜索，尝试当作详情页解析
         if books.is_empty() && is_search {
-            if let Some(b) = self.parse_info(source, body, &base_url, &vars)? {
+            if let Some(b) = self.parse_info(source, body, &base_url, &vars, &base_url)? {
                 books.push(b);
             }
         }
@@ -221,6 +292,8 @@ impl BookService {
     fn parse_book_item(&self, source: &BookSource, ctx: &mut RuleContext, el: &crate::engine::value::Val, base_url: &str, rule: &crate::model::BookListRule) -> AppResult<Option<Book>> {
         // 把单个元素作为上下文内容
         let mut item_ctx = ctx.with_content(el.clone());
+        let book_store = new_var_store();
+        item_ctx.book_vars = Some(book_store.clone());
 
         let name = get_s(&mut item_ctx, rule.name.as_deref())?;
         if name.is_empty() { return Ok(None); }
@@ -234,6 +307,7 @@ impl BookService {
         let cover_url = get_s_url(&mut item_ctx, rule.cover_url.as_deref())?;
         let intro = get_s(&mut item_ctx, rule.intro.as_deref())?;
 
+        self.save_scope(source, &format!("book:{}", book_url), &book_store);
         Ok(Some(Book {
             book_url, origin: source.book_source_url.clone(),
             origin_name: source.book_source_name.clone(), name, author, kind,
@@ -246,21 +320,24 @@ impl BookService {
     pub async fn book_info(&self, source: &BookSource, book_url: &str) -> AppResult<Book> {
         let (body, final_url) = self.fetch_url(book_url, source).await?;
         let vars = self.load_vars(source);
-        let book = self.parse_info(source, body, &final_url, &vars)?
+        let book = self.parse_info(source, body, &final_url, &vars, book_url)?
             .ok_or_else(|| AppError::internal("解析详情失败"))?;
         self.save_vars(source, &vars);
         Ok(book)
     }
 
-    fn parse_info(&self, source: &BookSource, body: String, base_url: &str, vars: &VarStore) -> AppResult<Option<Book>> {
+    fn parse_info(&self, source: &BookSource, body: String, base_url: &str, vars: &VarStore, book_key: &str) -> AppResult<Option<Book>> {
+        let book_store = self.load_scope(source, &format!("book:{}", book_key));
         let rule = source.rule_book_info.as_ref().ok_or_else(|| AppError::bad_request("书源缺少详情规则"))?;
         let mut ctx = self.make_context(body.clone(), base_url.to_string(), source, vars);
+        ctx.book_vars = Some(book_store.clone());
 
         // init 规则
         if let Some(init) = rule.init.as_deref().filter(|s| !s.is_empty()) {
             let init_result = ctx.get_string(init)?;
             if !init_result.is_empty() {
                 ctx = self.make_context(init_result, base_url.to_string(), source, vars);
+                ctx.book_vars = Some(book_store.clone());
             }
         }
 
@@ -277,6 +354,7 @@ impl BookService {
         if toc_url.is_empty() { toc_url = base_url.to_string(); }
         else { toc_url = absolute_url(base_url, &toc_url); }
 
+        self.save_scope(source, &format!("book:{}", book_key), &book_store);
         Ok(Some(Book {
             book_url: base_url.to_string(), origin: source.book_source_url.clone(),
             origin_name: source.book_source_name.clone(), name, author, kind,
@@ -296,6 +374,7 @@ impl BookService {
         let url = if book.toc_url.is_empty() { &book.book_url } else { &book.toc_url };
         let (body, final_url) = self.fetch_url(url, source).await?;
         let vars = self.load_vars(source);
+        let book_store = self.load_scope(source, &format!("book:{}", book.book_url));
 
         // 官方 BookChapterList.kt：`-` 前缀 → reverse=true；最终顺序 = 页面顺序（无前缀）或其反转（`-`）
         let raw_list_rule = rule.chapter_list.as_deref().unwrap_or("");
@@ -309,7 +388,7 @@ impl BookService {
 
         let mut visited: Vec<String> = vec![final_url.clone()];
         let (mut chapters, nexts) =
-            self.parse_toc_page(source, rule, &vars, body, &final_url, list_rule, true)?;
+            self.parse_toc_page(source, rule, &vars, &book_store, book, body, &final_url, list_rule, true)?;
 
         match nexts.len() {
             0 => {}
@@ -322,7 +401,7 @@ impl BookService {
                         Ok(r) => r,
                         Err(e) => { tracing::warn!("目录翻页失败 {}: {}", next, e.message); break; }
                     };
-                    let (c, n) = self.parse_toc_page(source, rule, &vars, b, &u, list_rule, true)?;
+                    let (c, n) = self.parse_toc_page(source, rule, &vars, &book_store, book, b, &u, list_rule, true)?;
                     chapters.extend(c);
                     next = n.into_iter().next().unwrap_or_default();
                 }
@@ -333,7 +412,7 @@ impl BookService {
                 for (u, r) in urls.iter().zip(fetched) {
                     match r {
                         Ok((b, fu)) => {
-                            let (c, _) = self.parse_toc_page(source, rule, &vars, b, &fu, list_rule, false)?;
+                            let (c, _) = self.parse_toc_page(source, rule, &vars, &book_store, book, b, &fu, list_rule, false)?;
                             chapters.extend(c);
                         }
                         Err(e) => tracing::warn!("目录分页抓取失败 {}: {}", u, e.message),
@@ -351,6 +430,7 @@ impl BookService {
         if should_reverse { chapters.reverse(); }
         for (i, c) in chapters.iter_mut().enumerate() { c.index = i; }
         self.save_vars(source, &vars);
+        self.save_scope(source, &format!("book:{}", book.book_url), &book_store);
         Ok(chapters)
     }
 
@@ -366,9 +446,11 @@ impl BookService {
     /// 解析一页目录，返回（章节列表，下一页 URL 列表）
     fn parse_toc_page(
         &self, source: &BookSource, rule: &crate::model::TocRule, vars: &VarStore,
-        body: String, page_url: &str, list_rule: &str, get_next: bool,
+        book_store: &VarStore, book: &Book, body: String, page_url: &str, list_rule: &str, get_next: bool,
     ) -> AppResult<(Vec<BookChapter>, Vec<String>)> {
         let mut ctx = self.make_context(body, page_url.to_string(), source, vars);
+        ctx.book_vars = Some(book_store.clone());
+        ctx.book = Some(Self::js_book(book));
         let elements = ctx.get_elements(list_rule)?;
 
         let mut nexts: Vec<String> = Vec::new();
@@ -393,6 +475,8 @@ impl BookService {
         for el in &elements {
             // 每个元素用独立上下文求值，规则才能完整支持 && / || / ## / {{js}} 等
             let mut item = ctx.with_content(el.clone());
+            let chapter_store = new_var_store();
+            item.chapter_vars = Some(chapter_store.clone());
             let title = get_s(&mut item, Some(name_rule))?;
             if title.is_empty() { continue; }
             let raw_url = get_s(&mut item, Some(url_rule))?;
@@ -413,6 +497,7 @@ impl BookService {
                     let t = v.to_text(); if !t.is_empty() { title = t; }
                 }
             }
+            self.save_scope(source, &format!("chapter:{}|{}", book.book_url, chapter_url), &chapter_store);
             chapters.push(BookChapter {
                 index: 0, title, url: chapter_url,
                 is_volume, is_vip,
@@ -429,7 +514,7 @@ impl BookService {
     /// 正文（含 nextContentUrl 翻页）。
     /// `next_chapter_url`：下一章的 URL，用于在“下一页”指向下一章时停止翻页（官方同样处理）。
     pub async fn content_with_next(
-        &self, source: &BookSource, _book: &Book, chapter: &BookChapter, next_chapter_url: Option<&str>,
+        &self, source: &BookSource, book: &Book, chapter: &BookChapter, next_chapter_url: Option<&str>,
     ) -> AppResult<String> {
         let rule = source.rule_content.as_ref().ok_or_else(|| AppError::bad_request("书源缺少正文规则"))?;
         let content_rule = rule.content.as_deref().unwrap_or("");
@@ -437,12 +522,16 @@ impl BookService {
 
         let (body, final_url) = self.fetch_url(&chapter.url, source).await?;
         let vars = self.load_vars(source);
+        let book_store = self.load_scope(source, &format!("book:{}", book.book_url));
+        let chapter_key = format!("chapter:{}|{}", book.book_url, chapter.url);
+        let chapter_store = self.load_scope(source, &chapter_key);
+        let scope = (book_store.clone(), chapter_store.clone(), Self::js_book(book));
         let next_chapter_abs = next_chapter_url
             .filter(|s| !s.is_empty())
             .map(|u| absolute_url(&final_url, u));
 
         let mut visited: Vec<String> = vec![final_url.clone()];
-        let (first, nexts) = self.parse_content_page(source, rule, &vars, chapter, body, &final_url, true)?;
+        let (first, nexts) = self.parse_content_page(source, rule, &vars, &scope, chapter, body, &final_url, true)?;
         let mut pages = vec![first];
 
         match nexts.len() {
@@ -456,7 +545,7 @@ impl BookService {
                         Ok(r) => r,
                         Err(e) => { tracing::warn!("正文翻页失败 {}: {}", next, e.message); break; }
                     };
-                    let (text, n) = self.parse_content_page(source, rule, &vars, chapter, b, &u, true)?;
+                    let (text, n) = self.parse_content_page(source, rule, &vars, &scope, chapter, b, &u, true)?;
                     pages.push(text);
                     next = n.into_iter().next().unwrap_or_default();
                 }
@@ -467,7 +556,7 @@ impl BookService {
                 for (u, r) in urls.iter().zip(fetched) {
                     match r {
                         Ok((b, fu)) => {
-                            let (text, _) = self.parse_content_page(source, rule, &vars, chapter, b, &fu, false)?;
+                            let (text, _) = self.parse_content_page(source, rule, &vars, &scope, chapter, b, &fu, false)?;
                             pages.push(text);
                         }
                         Err(e) => tracing::warn!("正文分页抓取失败 {}: {}", u, e.message),
@@ -485,15 +574,20 @@ impl BookService {
         }
         if text.trim().is_empty() { return Err(AppError::internal("正文为空")); }
         self.save_vars(source, &vars);
+        self.save_scope(source, &format!("book:{}", book.book_url), &book_store);
+        self.save_scope(source, &chapter_key, &chapter_store);
         Ok(text)
     }
 
     /// 解析一页正文，返回（正文文本，下一页 URL 列表）
     fn parse_content_page(
         &self, source: &BookSource, rule: &crate::model::ContentRule, vars: &VarStore,
-        chapter: &BookChapter, body: String, page_url: &str, get_next: bool,
+        scope: &(VarStore, VarStore, crate::engine::js::JsBook), chapter: &BookChapter, body: String, page_url: &str, get_next: bool,
     ) -> AppResult<(String, Vec<String>)> {
         let mut ctx = self.make_context(body, page_url.to_string(), source, vars);
+        ctx.book_vars = Some(scope.0.clone());
+        ctx.chapter_vars = Some(scope.1.clone());
+        ctx.book = Some(scope.2.clone());
         ctx.set_chapter_title(&chapter.title);
         let text = ctx.get_string_raw(rule.content.as_deref().unwrap_or(""))?;
         let text = crate::engine::htmlfmt::format_keep_img(&text, Some(page_url));
@@ -550,6 +644,43 @@ pub fn absolute_url(base: &str, url: &str) -> String {
         }
     }
     format!("{}/{}", base, url.trim_start_matches("./"))
+}
+
+#[cfg(test)]
+mod explore_var_tests {
+    use super::*;
+    fn svc() -> BookService {
+        let dir = std::env::temp_dir().join(format!("reader-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        BookService::new(Arc::new(Fetcher::new()), Arc::new(Db::open(&dir.join("t.db")).unwrap()))
+    }
+    fn src(explore: &str) -> BookSource {
+        serde_json::from_value(serde_json::json!({"bookSourceUrl":"http://x.com","bookSourceName":"x","exploreUrl":explore})).unwrap()
+    }
+    #[test]
+    fn explore_kinds_formats() {
+        let s = svc();
+        let a = s.explore_kinds(&src("玄幻::/xh/{{page}}.html&&都市::/ds.html\n科幻::/kh.html"));
+        assert_eq!(a.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(), vec!["玄幻","都市","科幻"]);
+        assert_eq!(a[0].url, "/xh/{{page}}.html");
+        let b = s.explore_kinds(&src(r#"[{"title":"热门","url":"/hot"}]"#));
+        assert_eq!(b[0].url, "/hot");
+        let c = s.explore_kinds(&src("@js:'甲::/a&&乙::/b'"));
+        assert_eq!(c.len(), 2);
+        let d = s.explore_kinds(&src("<js>JSON.stringify([{title:'丙',url:'/c'}])</js>"));
+        assert_eq!(d[0].title, "丙");
+    }
+    #[test]
+    fn book_and_chapter_vars_persist() {
+        let s = svc();
+        let source = src("");
+        let st = s.load_scope(&source, "book:u");
+        st.lock().unwrap().insert("k".into(), "v".into());
+        s.save_scope(&source, "book:u", &st);
+        let again = s.load_scope(&source, "book:u");
+        assert_eq!(again.lock().unwrap().get("k").unwrap(), "v");
+        assert!(s.load_scope(&source, "book:other").lock().unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]

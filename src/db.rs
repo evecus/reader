@@ -59,6 +59,15 @@ CREATE TABLE IF NOT EXISTS source_variables (
   updated_at INTEGER NOT NULL DEFAULT 0
 );
 
+-- 书级/章节级变量（对应 Legado Book.variable / BookChapter.variable）
+CREATE TABLE IF NOT EXISTS rule_vars (
+  source_url TEXT NOT NULL,
+  scope_key TEXT NOT NULL,
+  variables TEXT NOT NULL DEFAULT '{}',
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (source_url, scope_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_shelf_book ON shelf(book_url);
 CREATE INDEX IF NOT EXISTS idx_cache_book ON cached_chapters(book_url);
 "#;
@@ -342,6 +351,29 @@ impl Db {
             Some(s) => serde_json::from_str(&s).map_err(Into::into),
             None => Ok(Value::Object(Default::default())),
         }
+    }
+
+    /// 读取书/章节级变量（scope_key 形如 `book:<url>` / `chapter:<book>|<chapter>`）
+    pub fn get_rule_vars(&self, source_url: &str, scope_key: &str) -> AppResult<Value> {
+        let raw: Option<String> = self.conn()?.query_row(
+            "SELECT variables FROM rule_vars WHERE source_url=?1 AND scope_key=?2",
+            params![source_url, scope_key], |r| r.get(0),
+        ).optional()?;
+        match raw {
+            Some(s) => serde_json::from_str(&s).map_err(Into::into),
+            None => Ok(Value::Object(Default::default())),
+        }
+    }
+
+    pub fn set_rule_vars(&self, source_url: &str, scope_key: &str, variables: &Value) -> AppResult<()> {
+        let raw = serde_json::to_string(variables)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        self.conn()?.execute(
+            "INSERT INTO rule_vars(source_url,scope_key,variables,updated_at) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(source_url,scope_key) DO UPDATE SET variables=excluded.variables, updated_at=excluded.updated_at",
+            params![source_url, scope_key, raw, now],
+        )?;
+        Ok(())
     }
 
     /// 覆写书源变量 JSON（同一书源串行更新，避免并发覆盖）
