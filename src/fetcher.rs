@@ -26,6 +26,10 @@ pub struct RequestSpec {
     pub timeout_secs: u64,
     /// URL 选项 {"webView": true}：请求经 headless Chrome 渲染后取源码
     pub webview: bool,
+    /// URL 选项 `js`：请求前执行，入参 url，返回新 URL（官方 UrlOption.js）
+    pub js: Option<String>,
+    /// URL 选项 `bodyJs`：响应后执行，入参响应体，返回新响应体
+    pub body_js: Option<String>,
 }
 
 impl RequestSpec {
@@ -33,7 +37,7 @@ impl RequestSpec {
     /// `source_headers` 为书源级 header JSON，会被选项 headers 覆盖。
     pub fn parse(raw: &str, source_headers: Option<&str>) -> Self {
         let (url, opts) = split_options(raw);
-        let opts: Option<Value> = opts.and_then(|o| serde_json::from_str(&o).ok());
+        let opts: Option<Value> = opts.and_then(|o| parse_option_json(&o));
 
         let mut method = "GET".to_string();
         let mut body = String::new();
@@ -42,6 +46,8 @@ impl RequestSpec {
         let mut timeout_secs = 30u64;
         let mut webview = false;
         let mut extra_headers: Option<Value> = None;
+        let mut js = None;
+        let mut body_js = None;
 
         if let Some(o) = &opts {
             if let Some(m) = o.get("method").and_then(|v| v.as_str()) {
@@ -67,14 +73,20 @@ impl RequestSpec {
                     || w.as_str().map(|s| s.eq_ignore_ascii_case("true")).unwrap_or(false);
             }
             if let Some(h) = o.get("headers") {
-                extra_headers = Some(h.clone());
+                // 官方 UrlOption.getHeaderMap：对象或 JSON 字符串均可
+                extra_headers = match h {
+                    Value::String(t) => parse_option_json(t),
+                    other => Some(other.clone()),
+                };
             }
+            js = o.get("js").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).map(String::from);
+            body_js = o.get("bodyJs").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).map(String::from);
             // jsUrl 常见写法：bodyJs / js 在 URL 脚本阶段已处理，这里仅消费静态字段。
         }
 
         // 合并 headers：书源 header 为底，选项 headers 覆盖
         let merged = merge_headers(source_headers, extra_headers.as_ref());
-        Self { url, method, body, headers_json: merged, charset, retry, timeout_secs, webview }
+        Self { url, method, body, headers_json: merged, charset, retry, timeout_secs, webview, js, body_js }
     }
 }
 
@@ -138,7 +150,16 @@ impl Fetcher {
     pub fn prepare_url(url: &str, key: Option<&str>, page: Option<i32>) -> String {
         let mut result = url.to_string();
         if let Some(k) = key {
-            result = result.replace("{{key}}", &urlencoding_encode(k));
+            // 官方：key 原样替换，之后由 charset 决定如何编码；位于选项 JSON 内时做 JSON 转义
+            let (head, opts) = split_options(&result);
+            result = match opts {
+                Some(o) => {
+                    let esc = serde_json::to_string(k).unwrap_or_default();
+                    let esc = esc.trim_matches('"');
+                    format!("{},{}", head.replace("{{key}}", k), o.replace("{{key}}", esc))
+                }
+                None => result.replace("{{key}}", k),
+            };
         }
         if let Some(p) = page {
             // {{page}} 或 {{page:1,2,3}}
@@ -195,7 +216,11 @@ impl Fetcher {
     /// 异步请求：完整消费 RequestSpec（method/body/headers/charset/retry/timeout）。
     /// 这是四条业务链的主请求入口，支持 POST 搜索。
     pub async fn request(&self, raw: &str, source_headers: Option<&str>) -> AppResult<(String, String)> {
-        let spec = RequestSpec::parse(raw, source_headers);
+        self.request_spec(RequestSpec::parse(raw, source_headers)).await
+    }
+
+    /// 已解析（并可能被 `js` 选项改写）的规格 → 响应（正文, 最终 URL）
+    pub async fn request_spec(&self, mut spec: RequestSpec) -> AppResult<(String, String)> {
         // {"webView": true}：headless Chrome 渲染取源码；失败回退普通请求
         if spec.webview {
             let url = spec.url.clone();
@@ -210,14 +235,7 @@ impl Fetcher {
             }
         }
         let mut hm = Self::parse_headers(Some(&spec.headers_json), &spec.url);
-        // 若指定 charset 且未声明 Content-Type，补一个 charset 提示（部分站点据此返回对应编码）
-        if let Some(cs) = &spec.charset {
-            if !hm.contains_key(CONTENT_TYPE) && !spec.body.is_empty() {
-                if let Ok(v) = HeaderValue::from_str(&format!("application/x-www-form-urlencoded; charset={}", cs)) {
-                    hm.insert(CONTENT_TYPE, v);
-                }
-            }
-        }
+        encode_request(&mut spec, &mut hm);
         self.cookies.inject(&mut hm, &spec.url);
 
         let mut last_err: Option<AppError> = None;
@@ -279,7 +297,7 @@ impl Fetcher {
         source_headers: Option<&str>,
         timeout_override_ms: Option<u64>,
     ) -> Result<FetchResponse, String> {
-        let spec = RequestSpec::parse(raw, source_headers);
+        let mut spec = RequestSpec::parse(raw, source_headers);
         let timeout_ms = timeout_override_ms.unwrap_or(spec.timeout_secs * 1000).clamp(1, 300_000);
         // {"webView": true}：headless Chrome 渲染取源码；失败回退普通请求
         if spec.webview {
@@ -295,6 +313,7 @@ impl Fetcher {
             }
         }
         let mut hm = Self::parse_headers(Some(&spec.headers_json), &spec.url);
+        encode_request(&mut spec, &mut hm);
         self.cookies.inject(&mut hm, &spec.url);
         let client = match reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_millis(timeout_ms))
@@ -338,16 +357,143 @@ impl Fetcher {
     }
 }
 
-/// 拆分 `url,{"...":...}` → (url, Some(options_json))
+/// 拆分 `url,{"...":...}` → (url, Some(options_json))。
+/// 官方 paramPattern 为 `\s*,\s*(?=\{)`：取第一个满足「其后是合法（含宽松）JSON 对象」的逗号。
 fn split_options(raw: &str) -> (String, Option<String>) {
     let s = raw.trim();
-    if let Some(idx) = s.rfind(",{") {
-        let candidate = &s[idx + 1..];
-        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
-            return (s[..idx].trim().to_string(), Some(candidate.to_string()));
+    let bytes = s.as_bytes();
+    for (i, &c) in bytes.iter().enumerate() {
+        if c != b',' { continue; }
+        let rest = s[i + 1..].trim_start();
+        if rest.starts_with('{') && parse_option_json(rest).is_some() {
+            return (s[..i].trim().to_string(), Some(rest.to_string()));
         }
     }
     (s.to_string(), None)
+}
+
+/// 选项 JSON：先严格解析，失败再走宽松（单引号、无引号 key、尾逗号等），对应官方 GSONStrict → GSON
+fn parse_option_json(t: &str) -> Option<Value> {
+    if let Ok(v) = serde_json::from_str::<Value>(t) { return Some(v); }
+    json5::from_str::<Value>(t).ok().filter(|v| v.is_object())
+}
+
+fn is_json_text(s: &str) -> bool {
+    let t = s.trim();
+    (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'))
+}
+fn is_xml_text(s: &str) -> bool { let t = s.trim(); t.starts_with('<') && t.ends_with('>') }
+
+fn is_hex(c: u8) -> bool { c.is_ascii_hexdigit() }
+
+/// 对应 `NetworkUtils.encodedQuery/encodedForm`：已是合法 url 编码则无需再编码
+fn already_encoded(s: &str, safe: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_alphanumeric() || safe.as_bytes().contains(&c) { i += 1; continue; }
+        if c == b'%' && i + 2 < b.len() && is_hex(b[i + 1]) && is_hex(b[i + 2]) { i += 3; continue; }
+        return false;
+    }
+    true
+}
+const QUERY_SAFE: &str = "!$&()*+,-./:;=?@[\\]^_`{|}~";
+const FORM_SAFE: &str = "*-._";
+
+/// 按 charset 把字符串转成字节（`utf-8` 为默认）
+fn charset_bytes(s: &str, charset: &str) -> Vec<u8> {
+    match encoding_rs::Encoding::for_label(charset.trim().as_bytes()) {
+        Some(enc) => enc.encode(s).0.into_owned(),
+        None => s.as_bytes().to_vec(),
+    }
+}
+
+/// Java `URLEncoder.encode(s, charset)`：字母数字与 `*-._` 保留，空格 → `+`，其余 %XX
+fn form_encode(s: &str, charset: &str) -> String {
+    let mut out = String::new();
+    for &b in &charset_bytes(s, charset) {
+        if b.is_ascii_alphanumeric() || b"*-._".contains(&b) { out.push(b as char); }
+        else if b == b' ' { out.push('+'); }
+        else { out.push_str(&format!("%{:02X}", b)); }
+    }
+    out
+}
+
+/// 官方 queryEncoder：RFC3986 unreserved + `!$%&()*+,/:;=?@[\]^`{|}` 保留，其余按 charset 字节 %XX
+fn query_encode(s: &str, charset: &str) -> String {
+    let mut out = String::new();
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        if ch.is_ascii() && (ch.is_ascii_alphanumeric() || "-._~!$%&()*+,/:;=?@[\\]^`{|}".contains(ch)) {
+            out.push(ch);
+        } else {
+            let t = ch.encode_utf8(&mut buf);
+            for b in charset_bytes(t, charset) { out.push_str(&format!("%{:02X}", b)); }
+        }
+    }
+    out
+}
+
+/// 官方 `EncoderUtils.escape`（charset = "escape"）
+fn js_escape(s: &str) -> String {
+    let mut out = String::new();
+    for u in s.encode_utf16() {
+        if (u as u8 as u16 == u) && (u as u8).is_ascii_alphanumeric() { out.push(u as u8 as char); }
+        else if u < 16 { out.push_str(&format!("%0{:x}", u)); }
+        else if u < 256 { out.push_str(&format!("%{:x}", u)); }
+        else { out.push_str(&format!("%u{:x}", u)); }
+    }
+    out
+}
+
+/// 对应官方 `encodeParams`：POST 表单逐字段（`k=v&k2=v2`）编码
+fn encode_form(params: &str, charset: Option<&str>) -> String {
+    let cs = charset.map(str::trim).filter(|c| !c.is_empty());
+    let check = cs.is_none();
+    let enc = |v: &str| -> String {
+        if check && already_encoded(v, FORM_SAFE) { return v.to_string(); }
+        match cs {
+            Some("escape") => js_escape(v),
+            Some(c) => form_encode(v, c),
+            None => form_encode(v, "utf-8"),
+        }
+    };
+    params.split('&').map(|kv| match kv.split_once('=') {
+        Some((k, v)) => format!("{}={}", enc(k), enc(v)),
+        None => enc(kv),
+    }).collect::<Vec<_>>().join("&")
+}
+
+/// 对应官方 `AnalyzeUrl.analyzeUrl` 尾部 + 请求体构造：
+/// - GET/HEAD：query 按 charset 编码（已编码则不动）
+/// - POST：JSON/XML body 原样发送（Content-Type 取头里的，否则 application/json）；
+///   其余按表单逐字段编码，Content-Type: application/x-www-form-urlencoded
+pub(crate) fn encode_request(spec: &mut RequestSpec, hm: &mut HeaderMap) {
+    let charset = spec.charset.clone().unwrap_or_default();
+    if spec.method == "POST" {
+        let has_ct = hm.contains_key(CONTENT_TYPE);
+        let body = spec.body.clone();
+        if !body.trim().is_empty() && (is_json_text(&body) || is_xml_text(&body) || has_ct) {
+            if !has_ct {
+                if let Ok(v) = HeaderValue::from_str("application/json; charset=UTF-8") { hm.insert(CONTENT_TYPE, v); }
+            }
+        } else {
+            spec.body = encode_form(&body, spec.charset.as_deref());
+            if let Ok(v) = HeaderValue::from_str("application/x-www-form-urlencoded") { hm.insert(CONTENT_TYPE, v); }
+        }
+    } else if let Some(pos) = spec.url.find('?') {
+        let (base, query) = (spec.url[..pos].to_string(), spec.url[pos + 1..].to_string());
+        let (query, frag) = match query.split_once('#') { Some((q, f)) => (q.to_string(), format!("#{}", f)), None => (query, String::new()) };
+        let q = if charset == "escape" {
+            encode_form(&query, Some("escape"))
+        } else if already_encoded(&query, QUERY_SAFE) {
+            query
+        } else {
+            query_encode(&query, if charset.is_empty() { "utf-8" } else { &charset })
+        };
+        spec.url = format!("{}?{}{}", base, q, frag);
+    }
 }
 
 /// 编码检测：优先显式 charset，其次 meta charset，最后 UTF-8→GBK 兜底

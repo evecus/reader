@@ -14,10 +14,12 @@ use std::sync::Arc;
 pub struct BookService {
     pub fetcher: Arc<Fetcher>,
     pub db: Arc<Db>,
+    /// `@js:` / `<js>` 请求头的求值缓存：(书源 URL, 原始 header) → (时间, JSON)
+    header_cache: std::sync::Mutex<std::collections::HashMap<(String, String), (std::time::Instant, String)>>,
 }
 
 impl BookService {
-    pub fn new(fetcher: Arc<Fetcher>, db: Arc<Db>) -> Self { Self { fetcher, db } }
+    pub fn new(fetcher: Arc<Fetcher>, db: Arc<Db>) -> Self { Self { fetcher, db, header_cache: Default::default() } }
 
     /// 从 db 加载书源持久化变量到共享表，并注入书元信息
     fn load_vars(&self, source: &BookSource) -> VarStore {
@@ -89,7 +91,7 @@ impl BookService {
         -> std::sync::Arc<dyn Fn(&str, &str, u64) -> Result<FetchResponse, String> + Send + Sync>
     {
         let fetcher = self.fetcher.clone();
-        let header = source.header.clone().unwrap_or_default();
+        let header = self.source_header(source).unwrap_or_default();
         Arc::new(move |url: &str, _h: &str, timeout: u64| {
             fetcher.request_blocking_full(url, Some(&header), (timeout != 0).then_some(timeout))
         })
@@ -238,8 +240,73 @@ impl BookService {
     /// 请求 URL：完整消费 Legado 选项语法
     /// `url,{"method":"POST","body":"...","headers":{...},"charset":"gbk","retry":n,"timeout":n}`
     /// 支持 POST 搜索，语义由 Fetcher::request 统一处理。
+    /// 书源请求头：`header` 以 `@js:` / `<js>` 开头时先求值得到 JSON（官方 `BookSource.getHeaderMap`）。
+    /// 求值上下文不带 fetch 闭包，避免与 make_context 递归；结果缓存 5 分钟。
+    fn source_header(&self, source: &BookSource) -> Option<String> {
+        let raw = source.header.clone()?;
+        let t = raw.trim();
+        let lower = t.to_ascii_lowercase();
+        if !(lower.starts_with("@js:") || lower.starts_with("<js>")) { return Some(raw); }
+        let key = (source.book_source_url.clone(), raw.clone());
+        if let Ok(c) = self.header_cache.lock() {
+            if let Some((at, v)) = c.get(&key) {
+                if at.elapsed().as_secs() < 300 { return Some(v.clone()); }
+            }
+        }
+        let script = if lower.starts_with("<js>") {
+            let b = &t[4..];
+            match b.to_ascii_lowercase().rfind("</js>") { Some(i) => b[..i].to_string(), None => b.to_string() }
+        } else { t[4..].to_string() };
+        let vars = self.load_vars(source);
+        let mut ctx = RuleContext::new(String::new(), source.book_source_url.clone());
+        ctx.js_lib = source.js_lib.clone().unwrap_or_default();
+        ctx.variables = vars.clone();
+        ctx.cookies = self.fetcher.cookies.clone();
+        ctx.source_url = source.book_source_url.clone();
+        ctx.source_name = source.book_source_name.clone();
+        let out = match ctx.eval_js(&script, &crate::engine::value::Val::Str(String::new())) {
+            Ok(v) => v.to_text(),
+            Err(e) => { tracing::warn!("书源请求头 JS 执行失败: {}", e.message); return None; }
+        };
+        self.save_vars(source, &vars);
+        if let Ok(mut c) = self.header_cache.lock() { c.insert(key, (std::time::Instant::now(), out.clone())); }
+        Some(out)
+    }
+
+    /// 请求 URL：完整消费 Legado 选项语法（官方 AnalyzeUrl）
+    /// `url,{"method":"POST","body":"...","headers":{...},"charset":"gbk","retry":n,"timeout":n,"js":"...","bodyJs":"..."}`
     async fn fetch_url(&self, raw: &str, source: &BookSource) -> AppResult<(String, String)> {
-        self.fetcher.request(raw, source.header.as_deref()).await
+        let header = self.source_header(source);
+        let mut spec = crate::fetcher::RequestSpec::parse(raw, header.as_deref());
+        // 选项 js：入参 url，返回值替换请求 URL
+        if let Some(js) = spec.js.clone() {
+            let vars = self.load_vars(source);
+            let mut ctx = self.make_context(String::new(), spec.url.clone(), source, &vars);
+            ctx.source_url = source.book_source_url.clone();
+            ctx.source_name = source.book_source_name.clone();
+            match ctx.eval_js(&js, &crate::engine::value::Val::Str(spec.url.clone())) {
+                Ok(v) => { let t = v.to_text(); if !t.trim().is_empty() && !v.is_null() { spec.url = t.trim().to_string(); } }
+                Err(e) => tracing::warn!("URL 选项 js 执行失败: {}", e.message),
+            }
+            self.save_vars(source, &vars);
+        }
+        let body_js = spec.body_js.clone();
+        let base = spec.url.clone();
+        let (mut body, final_url) = self.fetcher.request_spec(spec).await?;
+        // 选项 bodyJs：入参响应体，返回新响应体
+        if let Some(js) = body_js {
+            let vars = self.load_vars(source);
+            let mut ctx = self.make_context(String::new(), final_url.clone(), source, &vars);
+            ctx.set_redirect_url(&final_url);
+            ctx.source_url = source.book_source_url.clone();
+            ctx.source_name = source.book_source_name.clone();
+            match ctx.eval_js(&js, &crate::engine::value::Val::Str(body.clone())) {
+                Ok(v) => if !v.is_null() { body = v.to_text(); },
+                Err(e) => tracing::warn!("URL 选项 bodyJs 执行失败 {}: {}", base, e.message),
+            }
+            self.save_vars(source, &vars);
+        }
+        Ok((body, final_url))
     }
 
     /// 多源并发搜索
@@ -817,5 +884,107 @@ mod pagination_tests {
         // /c/1 页面正文为 "第一页内容"，JS 规则拼接了清洗文本与 '$1' 字面量
         assert!(text.contains("第一页内容"), "实际正文: {}", text);
         assert!(text.contains("$1"), "JS 字面量 $1 不应被当正则组解析: {}", text);
+    }
+}
+
+#[cfg(test)]
+mod url_option_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// 回显服务：把收到的原始请求头+体原样作为响应体返回
+    async fn echo_server() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut n = 0;
+                    // 读到头结束，再按 Content-Length 补体
+                    loop {
+                        let m = s.read(&mut buf[n..]).await.unwrap_or(0);
+                        if m == 0 { break; }
+                        n += m;
+                        let t = String::from_utf8_lossy(&buf[..n]).to_string();
+                        if let Some(i) = t.find("\r\n\r\n") {
+                            let cl = t.to_ascii_lowercase().split("content-length:").nth(1)
+                                .and_then(|x| x.split("\r\n").next()).and_then(|x| x.trim().parse::<usize>().ok()).unwrap_or(0);
+                            if n >= i + 4 + cl { break; }
+                        }
+                    }
+                    let body = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    let _ = s.write_all(resp.as_bytes()).await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+    fn svc() -> BookService {
+        let dir = std::env::temp_dir().join(format!("reader-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        BookService::new(Arc::new(Fetcher::new()), Arc::new(Db::open(&dir.join("t.db")).unwrap()))
+    }
+    fn src(port: u16, header: Option<&str>) -> BookSource {
+        serde_json::from_value(serde_json::json!({
+            "bookSourceUrl": format!("http://127.0.0.1:{}", port), "bookSourceName": "e",
+            "header": header,
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gbk_query_and_form_encoding() {
+        let port = echo_server().await;
+        let s = svc();
+        let sc = src(port, None);
+        let u = s.resolve_url(&sc, &format!(r#"http://127.0.0.1:{}/s?q={{{{key}}}}&p=1,{{"charset":"gbk"}}"#, port), Some("中文"), 1).unwrap();
+        let (b, _) = s.fetch_url(&u, &sc).await.unwrap();
+        assert!(b.contains("GET /s?q=%D6%D0%CE%C4&p=1 "), "{}", b);
+        // UTF-8 默认
+        let u = s.resolve_url(&sc, &format!("http://127.0.0.1:{}/s?q={{{{key}}}}", port), Some("中"), 1).unwrap();
+        let (b, _) = s.fetch_url(&u, &sc).await.unwrap();
+        assert!(b.contains("GET /s?q=%E4%B8%AD "), "{}", b);
+        // POST 表单 + GBK，空格→+
+        let u = s.resolve_url(&sc, &format!(r#"http://127.0.0.1:{}/p,{{"method":"POST","body":"k={{{{key}}}}&t=a b","charset":"gbk"}}"#, port), Some("中文"), 1).unwrap();
+        let (b, _) = s.fetch_url(&u, &sc).await.unwrap();
+        assert!(b.contains("k=%D6%D0%CE%C4&t=a+b"), "{}", b);
+        assert!(b.to_ascii_lowercase().contains("application/x-www-form-urlencoded"), "{}", b);
+    }
+
+    #[tokio::test]
+    async fn json_body_not_encoded_and_content_type() {
+        let port = echo_server().await;
+        let s = svc();
+        let sc = src(port, None);
+        let u = s.resolve_url(&sc, &format!(r#"http://127.0.0.1:{}/j,{{"method":"POST","body":{{"kw":"{{{{key}}}}","n":1}},"charset":"gbk"}}"#, port), Some("中\"文"), 1).unwrap();
+        let (b, _) = s.fetch_url(&u, &sc).await.unwrap();
+        // 响应按 charset=gbk 解码会乱码（回显服务返回 UTF-8），这里用 Content-Length 证明请求体是未编码的 UTF-8 JSON
+        assert!(b.contains("content-length: 23"), "{}", b);
+        assert!(b.to_ascii_lowercase().contains("application/json"), "{}", b);
+    }
+
+    #[tokio::test]
+    async fn header_js_and_option_js_bodyjs_and_lenient_options() {
+        let port = echo_server().await;
+        let s = svc();
+        let sc = src(port, Some(r#"@js:JSON.stringify({"X-Tok": "t" + (1+2)})"#));
+        // 宽松选项：单引号 + 无引号 key；js 改写 URL；bodyJs 改写响应体
+        let raw = format!("http://127.0.0.1:{}/a,{{method:'GET',js:\"result+'?z=1'\",bodyJs:\"result.length>0?'OK:'+result.split(String.fromCharCode(10))[0]:''\"}}", port);
+        let (b, _) = s.fetch_url(&raw, &sc).await.unwrap();
+        assert!(b.starts_with("OK:GET /a?z=1 "), "{}", b);
+        let (b2, _) = s.fetch_url(&format!("http://127.0.0.1:{}/h", port), &sc).await.unwrap();
+        assert!(b2.to_ascii_lowercase().contains("x-tok: t3"), "{}", b2);
+    }
+
+    #[tokio::test]
+    async fn url_expression_page_math() {
+        let s = svc();
+        let sc = src(1, None);
+        let u = s.resolve_url(&sc, "http://x.com/l?o={{(page-1)*20}}&k={{key}}&p=<1,2,3>", Some("a b"), 3).unwrap();
+        assert_eq!(u, "http://x.com/l?o=40&k=a b&p=3");
     }
 }
